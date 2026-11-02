@@ -1,0 +1,4252 @@
+/*
+ * « 1883. Il faut qu'il n'exige pas le secret, et qu'il puisse sans inconvénient tomber entre les mains de l'ennemi. Kerckhoffs. »
+ *
+ * Kerckhoffs — masquez vos données avant de travailler avec une IA.
+ * Licence GNU AGPL 3.0 ou ultérieure. Tout se passe sur l'appareil : ce fichier ne contacte aucun serveur.
+ */
+"use strict";
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const MAX_DIM = 2400;          // taille maximale d'une page, en pixels
+  const LIGHT_DIM = 1600;        // taille maximale d'une image allégée
+  const abs = (p) => new URL(p, location.href).href;
+
+  // Version figée (un seul fichier, sans mise à jour) : les moteurs sont inclus dans le fichier lui-même.
+  const FIGE = window.KerckhoffsFige || null;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = FIGE ? FIGE.pdfWorker : abs("vendor/pdfjs/pdf.worker.min.js");
+
+  // Règles : communes + celles du pays choisi (rules/pays/*.js). Les longs numéros passent en dernier.
+  const K = window.Kerckhoffs;
+  let paysChoisi = "CH";
+  try { paysChoisi = localStorage.getItem("kerckhoffs-pays") || "CH"; } catch (e) {}
+  if (!K.pays[paysChoisi]) paysChoisi = Object.keys(K.pays)[0];
+  const rules = () => K.commun.concat(K.pays[paysChoisi] ? K.pays[paysChoisi].regles : [])
+    .sort((a, b) => (a.id === "longnum") - (b.id === "longnum"));
+  (function remplirPays() {
+    const sel = document.getElementById("pays");
+    Object.values(K.pays).sort((a, b) => a.nom.localeCompare(b.nom)).forEach((p) => {
+      const o = document.createElement("option");
+      o.value = p.code; o.textContent = p.nom; o.selected = p.code === paysChoisi;
+      sel.append(o);
+    });
+    sel.addEventListener("change", () => {
+      paysChoisi = sel.value;
+      try { localStorage.setItem("kerckhoffs-pays", paysChoisi); } catch (e) {}
+      if (S.pages.length) { S.tokens = new Map(); S.counters = {}; detectPages(S.pages); }
+    });
+  })();
+
+  // Un seul espace de travail : une ou plusieurs pages.
+  // « Image et texte » d'abord : l'image donne la mise en page, le texte se lit sans erreur de chiffre. Les deux ensemble, c'est le mieux pour l'IA.
+  const FORMATS = [["both", "Image et texte"], ["image", "Image seule"], ["pdf", "PDF"], ["light", "Image allégée"], ["text", "Texte seul"]];
+
+  /* ------------------------------------------------------------------ état */
+  const S = {
+    pages: [],          // { img, name, strokes:[], boxes:[], lines:null }
+    cur: 0,
+    tokens: new Map(),  // clé -> { token, type, value }
+    counters: {},
+    view: { s: 1, tx: 0, ty: 0 },
+    version: 0,         // change à chaque modification
+    cache: null,        // { key, out } dernier export préparé
+    extra: [],          // motifs ajoutés par « Masquer tous les pareils » (pour cette session)
+    zones: [],          // zones répétées sur chaque page, en proportions de la page : { x, y, w, h } entre 0 et 1
+    sel: null,          // zone sélectionnée au rectangle : { page, rect }
+    leaving: false,
+  };
+  // Pour les tests sur l'ordinateur du développeur uniquement (jamais sur l'adresse publique).
+  if (location.hostname === "localhost") { window.__kerckhoffsTest = S; window.__kerckhoffsAuDessus = (p) => valeursAuDessus(p); window.__kerckhoffsReperes = (p) => reperesDe(p); window.__kerckhoffsCodes = (p) => codesBarresForme(p); }
+  const cv = $("cv");
+  const ctx = cv.getContext("2d");
+  const page = () => S.pages[S.cur];
+  const changed = () => { S.version++; };
+  // Ce qui recouvre les données : « auto » (papier pour un document, flou opaque pour une photo), « papier », « flou » ou « noir ».
+  let styleMasque = "auto";
+  try { const v = localStorage.getItem("kerckhoffs-style"); if (["auto", "papier", "flou", "noir"].includes(v)) styleMasque = v; } catch (e) {}
+  let cerbereOk = -1;        // version du document déjà validée par la vérification avant envoi
+
+  /* Tout ce que Kerckhoffs écrit sur le document envoyé (étiquettes, mention, ligne K:OFF, consigne pour l'IA)
+   * existe en français et en anglais : chaque phrase a sa jumelle. La langue se choisit dans « Réglages ». */
+  let langueDoc = "fr";
+  try { langueDoc = localStorage.getItem("kerckhoffs-langue-doc") || ((navigator.language || "fr").toLowerCase().startsWith("fr") ? "fr" : "en"); } catch (e) {}
+  if (!["fr", "en"].includes(langueDoc)) langueDoc = "fr";
+  const TEXTES_DOC = {
+    fr: {
+      masque: "MASQUÉ",
+      mention: "Masqué par l'utilisateur, avec Kerckhoffs",
+      papier: "effacé couleur papier",
+      regroupe: "regroupements faits par l'utilisateur",
+      verifie: "vérifié point par point",
+      nonVerifie: "non vérifié point par point",
+      kOff: "K:OFF · détection automatique désactivée, effacé à la main · kerckhoffs.app",
+      page: "Page",
+      consigne: "Document masqué avec Kerckhoffs. Les éléments entre crochets remplacent des données personnelles. Une même étiquette désigne toujours la même chose ; deux étiquettes différentes peuvent aussi désigner la même chose, car Kerckhoffs ne relie rien de lui-même. Merci de garder ces étiquettes dans votre réponse.",
+      texteLu: "Le texte a été lu automatiquement sur l'image : en cas de différence, l'image fait foi. [?] marque un mot mal lu.",
+      consigneGroupes: "Les regroupements (même lettre) ont été faits par l'utilisateur, pas par Kerckhoffs.",
+    },
+    en: {
+      masque: "MASKED",
+      mention: "Masked by the user, with Kerckhoffs",
+      papier: "erased in paper colour",
+      regroupe: "groupings made by the user",
+      verifie: "checked point by point",
+      nonVerifie: "not checked point by point",
+      kOff: "K:OFF · automatic detection turned off, masked by hand · kerckhoffs.app",
+      page: "Page",
+      consigne: "Document masked with Kerckhoffs. Items in square brackets replace personal data. The same label always refers to the same thing; two different labels may also refer to the same thing, because Kerckhoffs never links items on its own. Please keep these labels in your answer.",
+      texteLu: "The text was read automatically from the image: if they differ, the image is right. [?] marks a word that could not be read reliably.",
+      consigneGroupes: "Items sharing a letter were grouped by the user, not by Kerckhoffs.",
+    },
+  };
+  const tr = (k) => TEXTES_DOC[langueDoc][k];
+  // Le nom des types dans les étiquettes : [PERSONNE_A] devient [PERSON_A] en anglais.
+  const TYPES_EN = { PERSONNE: "PERSON", NOM: "SURNAME", PRENOM: "FIRSTNAME", ADRESSE: "ADDRESS", NUMERO: "NUMBER", DONNEE: "DATA",
+    LIEU: "PLACE", NAISSANCE: "BIRTH", TEL: "PHONE", MOTIF: "PATTERN", IDENT: "ID", REFERENCE: "REFERENCE" };
+  const typeAffiche = (type) => (langueDoc === "en" && TYPES_EN[type]) || type;
+
+  // Le message s'affiche sous l'image et, bien visible, par-dessus l'image.
+  let busy = false;
+  let toastTimer = null;
+  // Le message du bas se ferme d'un toucher, et dès qu'on touche l'image : il ne gêne jamais le travail.
+  function fermerToast() { clearTimeout(toastTimer); $("toast").hidden = true; }
+  $("viewport").addEventListener("pointerdown", fermerToast, true);
+  function setStatus(t, keep) {
+    $("status").textContent = t || "";
+    const el = $("toast");
+    clearTimeout(toastTimer);
+    if (!t || $("work").hidden) { el.hidden = true; return; }
+    el.textContent = t; el.hidden = false;
+    if (!keep && !busy) toastTimer = setTimeout(() => { el.hidden = true; }, 6000);
+  }
+
+  /* ------------------------------------------------------------ navigation */
+  function openWork() {
+    wipe();
+    $("home").hidden = true;
+    $("work").hidden = false;
+    $("inFile").multiple = true;
+    $("inFile").accept = "application/pdf,image/*";
+    closeSheet();
+    buildFormats();
+    setTool(outilBase, true);
+    updateUI();
+    window.scrollTo(0, 0);
+  }
+
+  function wipe() {
+    S.pages = []; S.cur = 0; S.tokens = new Map(); S.counters = {}; S.cache = null; S.leaving = false; S.renomme = new Map(); S.choisis = [];
+    S.extra = []; S.zones = []; S.sel = null; $("selbar").hidden = true; $("zonesChip").hidden = true;
+    S.balayage = []; S.appris = []; S.parSelection = new Set(); S.trouves = null; S.orange = null; if ($("trouves")) $("trouves").hidden = true;
+    S.cadre = null; $("cropbar").hidden = true;
+    S.groupes = new Map(); S.sansEtiquette = new Set(); S.prochainGroupe = 0; relier = null; S.qualiteDite = false;
+    S.cadreDoc = null; $("cadrebar").hidden = true;
+    profilSnapshot = "";
+    history.length = 0;
+    ["tNames", "tAddr", "tOther"].forEach((id) => { $(id).value = ""; });
+    $("optMask").checked = true;
+    setStatus("");
+    changed();
+  }
+
+  function quitter() {
+    wipe(); fermerCamera();
+    $("work").hidden = true;
+    $("home").hidden = false;
+  }
+  $("back").addEventListener("click", () => {
+    if (profilModifie()) { $("finSession").hidden = false; return; } // garder les mots appris ?
+    if (S.pages.length && !S.leaving) {
+      S.leaving = true;
+      $("back").textContent = "Touchez encore : tout effacer et revenir à l'accueil";
+      setTimeout(() => { S.leaving = false; $("back").textContent = "Fermer le document et revenir à l'accueil"; }, 4000);
+      return;
+    }
+    $("back").textContent = "Fermer le document et revenir à l'accueil";
+    wipe(); fermerCamera(); closeSheet();
+    $("work").hidden = true;
+    $("home").hidden = false;
+  });
+
+  function buildFormats() {
+    const box = $("formats");
+    box.textContent = "";
+    FORMATS.forEach(([val, label], i) => {
+      const l = document.createElement("label");
+      const r = document.createElement("input");
+      r.type = "radio"; r.name = "fmt"; r.value = val; r.id = "fmt-" + val; r.checked = i === 0;
+      r.addEventListener("change", () => { changed(); updateUI(); });
+      l.append(r, document.createTextNode(" " + label));
+      box.append(l);
+    });
+  }
+  const fmt = () => (document.querySelector('input[name="fmt"]:checked') || {}).value;
+
+  // Le filigrane « ORIGINAL · NON MASQUÉ » reste sur l'écran tant que le document n'est pas validé (vérification avant envoi passée).
+  function majFiligrane() {
+    const cache = !S.pages.length || cerbereOk === S.version;
+    $("tampon").hidden = cache; $("tamponNote").hidden = cache;
+  }
+  function updateUI() {
+    const has = S.pages.length > 0;
+    $("empty").hidden = has;
+    majFiligrane();
+    cv.hidden = !has;
+    ["detect", "btnShare", "btnCopy", "btnSave", "mRect", "mChercher", "mGomme", "mRecadrer", "coinMove", "coinDoigt"].forEach((id) => { $(id).disabled = !has; });
+    updateUndo();
+    $("pageInfo").textContent = S.pages.length > 1 ? `page ${S.cur + 1} / ${S.pages.length}` : "";
+    $("ajoutDoc").hidden = !has; $("memeFormeBloc").hidden = !has;
+    const pg = $("pages");
+    pg.hidden = S.pages.length < 2;
+    pg.textContent = "";
+    S.pages.forEach((p, i) => {
+      const b = document.createElement("button");
+      b.type = "button"; b.textContent = "Page " + (i + 1);
+      b.setAttribute("aria-current", i === S.cur ? "true" : "false");
+      b.addEventListener("click", () => { S.cur = i; fitView(); render(); updateUI(); majStyleChip(); });
+      pg.append(b);
+    });
+    $("btnCopy").textContent = fmt() === "text" ? "Copier le texte" : fmt() === "both" ? "Copier l'image et le texte" : "Copier l'image";
+    $("modeChip").hidden = !MODES[tool] || !has;
+    majStyleChip();
+    renderLegend();
+  }
+
+  /* ------------------------------------------------------- chargement */
+  async function loadImage(file) {
+    try {
+      return await createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch (e) {
+      const url = URL.createObjectURL(file);
+      try {
+        const im = new Image();
+        im.decoding = "async";
+        im.src = url;
+        await im.decode();
+        return im;
+      } finally { URL.revokeObjectURL(url); }
+    }
+  }
+
+  // Redessiner l'image sur un canvas supprime toutes les métadonnées (GPS, date, appareil).
+  function toCanvas(src, w, h) {
+    const k = Math.min(1, MAX_DIM / Math.max(w, h));
+    const c = document.createElement("canvas");
+    c.width = Math.round(w * k); c.height = Math.round(h * k);
+    const x = c.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+    x.drawImage(src, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  // source : la photo d'origine, en pleine résolution, gardée compressée pour « Rechercher ici ».
+  // k : combien de pixels d'origine pour un pixel de l'image de travail ; off : décalage dû au recadrage.
+  const newPage = (img, name, source) => ({ img, name, strokes: [], boxes: [], lines: null, source: source || null, off: { x: 0, y: 0 } });
+  const sourceDe = (blob, largeur, c) => (blob && largeur > c.width * 1.05 ? { blob, k: largeur / c.width } : null);
+
+  // Un texte collé ou partagé devient une page : les mots sont placés par Kerckhoffs lui-même (pas besoin de lecture),
+  // puis la détection, les étiquettes et le contrôle avant envoi s'appliquent comme pour une photo.
+  function pageDepuisTexte(texte, nom) {
+    const marge = 60, taille = 26, interligne = 38, police = `${taille}px ui-monospace, Menlo, Consolas, monospace`;
+    const mesure = document.createElement("canvas").getContext("2d"); mesure.font = police;
+    // Une ligne par paragraphe, aussi longue que possible : une adresse ou un nom n'est jamais coupé en deux.
+    const largeurMax = 3600, lignes = [];
+    String(texte).replace(/\r\n?/g, "\n").split("\n").forEach((para) => {
+      let courante = [];
+      for (const mot of para.split(/\s+/).filter(Boolean)) {
+        const essai = courante.concat(mot).join(" ");
+        if (courante.length && mesure.measureText(essai).width > largeurMax) { lignes.push(courante); courante = [mot]; }
+        else courante.push(mot);
+      }
+      lignes.push(courante);
+    });
+    const W = Math.max(1240, Math.ceil(Math.max(...lignes.map((l) => mesure.measureText(l.join(" ")).width))) + 2 * marge);
+    const c = document.createElement("canvas");
+    c.width = W; c.height = Math.max(400, marge * 2 + lignes.length * interligne);
+    const x = c.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+    x.fillStyle = "#111"; x.font = police; x.textBaseline = "top";
+    const p = newPage(c, nom || "texte");
+    p.lines = []; p.texte = true;
+    lignes.forEach((mots, i) => {
+      const y = marge + i * interligne; let cx = marge; const words = [];
+      for (const m of mots) {
+        const w = mesure.measureText(m).width;
+        x.fillText(m, cx, y);
+        words.push({ text: m, bbox: { x0: cx, y0: y, x1: cx + w, y1: y + taille }, conf: 99 });
+        cx += w + mesure.measureText(" ").width;
+      }
+      p.lines.push({ words });
+    });
+    return p;
+  }
+  function ouvrirTexte(texte, nom) {
+    if (!String(texte || "").trim() || !$("ouverture").hidden) return false;
+    closeSheet();
+    if ($("work").hidden) openWork();
+    addPages([pageDepuisTexte(texte, nom)]);
+    const r = document.querySelector('input[name="fmt"][value="text"]');
+    if (r && !r.checked) { r.checked = true; r.dispatchEvent(new Event("change", { bubbles: true })); }
+    setStatus("Texte collé : relisez, puis « Copier » pour coller le texte masqué dans l'IA.", true);
+    return true;
+  }
+
+  async function addFiles(files) {
+    if (!files.length) return;
+    const added = [];
+    for (const f of files) {
+      try {
+        if (f.type === "text/plain") {
+          added.push(pageDepuisTexte(await f.text(), f.name || "texte"));
+        } else if (f.type === "application/pdf" || /\.pdf$/i.test(f.name)) {
+          setStatus("Lecture du PDF…");
+          // Le PDF est redessiné en images : texte caché, calques, formulaires et métadonnées disparaissent.
+          const pdf = await pdfjsLib.getDocument({ data: await f.arrayBuffer(), isEvalSupported: false, disableFontFace: false }).promise;
+          for (let i = 1; i <= pdf.numPages; i++) {
+            const pg = await pdf.getPage(i);
+            const v0 = pg.getViewport({ scale: 1 });
+            const vp = pg.getViewport({ scale: Math.min(3, MAX_DIM / Math.max(v0.width, v0.height)) });
+            const c = document.createElement("canvas");
+            c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+            const x = c.getContext("2d");
+            x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+            await pg.render({ canvasContext: x, viewport: vp, annotationMode: 0 }).promise;
+            added.push(newPage(c, `${f.name} p.${i}`));
+          }
+          pdf.destroy();
+        } else {
+          const im = await loadImage(f);
+          const c = toCanvas(im, im.width, im.height);
+          if (await estUnProfil(c)) continue; // c'est un QR code de profil, pas une page
+          added.push(newPage(c, f.name || "photo", sourceDe(f, im.width, c)));
+          if (im.close) im.close();
+        }
+      } catch (e) {
+        setStatus(`Impossible de lire « ${f.name} ». Essayez une photo ou un PDF.`);
+      }
+    }
+    addPages(added);
+    // Que du texte : l'envoi se fait en texte (masqué), à coller dans l'IA.
+    if (added.length && added.every((p) => p.texte)) {
+      const r = document.querySelector('input[name="fmt"][value="text"]');
+      if (r && !r.checked) { r.checked = true; r.dispatchEvent(new Event("change", { bubbles: true })); }
+    }
+  }
+
+  function addPages(added) {
+    if (!added.length) return;
+    closeSheet();
+    // « Même forme que le précédent » : les zones effacées du document précédent sont reportées, calées sur les coins de la page.
+    const cadre = S.cadreDoc && S.cadreDoc.modele && S.pages.includes(S.cadreDoc.modele) ? S.cadreDoc : null;
+    if (cadre) { added.forEach((p) => reporterCadre(cadre.modele, p)); cadre.dernier = added; }
+    S.pages.push(...added); S.cur = S.pages.length - added.length;
+    changed();
+    setStatus("");
+    updateUI();
+    requestAnimationFrame(() => { fitView(); render(); });
+    const fin = detectPages(added); // la détection démarre toute seule
+    if (cadre && fin) fin.then(() => verifierCadre(cadre, added));
+  }
+
+  /* --------- plusieurs documents : « Même forme que le précédent »
+   * Les traits et rectangles du document précédent sont reportés sur le nouveau, en proportion de la page (ses quatre coins).
+   * Puis Kerckhoffs vérifie le calage avec des mots repères du précédent (des mots imprimés, jamais masqués) : s'il en manque
+   * 4 sur 10, le cadre n'a pas pris, et on le dit. Kerckhoffs fonctionne normalement dans tous les cas. */
+  function reporterCadre(m, p) {
+    const sx = p.img.width / m.img.width, sy = p.img.height / m.img.height, sw = (sx + sy) / 2;
+    m.strokes.forEach((st, i) => {
+      let n = null;
+      if (st.kind === "rect") n = { kind: "rect", x: st.x * sx, y: st.y * sy, w: st.w * sx, h: st.h * sy };
+      else if (st.kind === "line") n = { kind: "line", w: st.w * sw, pts: st.pts.map(([x, y]) => [x * sx, y * sy]) };
+      if (!n) return;
+      if (st.ref) n.ref = { type: st.ref.type, value: "(reporté du document précédent)", key: st.ref.type + "|report|" + i };
+      n.report = true;
+      p.strokes.push(n);
+    });
+  }
+  function reperesDe(m) {
+    if (!m.lines) return [];
+    const W = m.img.width, H = m.img.height, couvert = strokeMask(m);
+    const cache = (w) => m.boxes.some((b) => b.active && (b.words || []).includes(w)) || couvert((w.bbox.x0 + w.bbox.x1) / 2, (w.bbox.y0 + w.bbox.y1) / 2);
+    const mots = m.lines.flatMap((l) => l.words).filter((w) => (w.conf == null || w.conf >= 80) && /^[A-Za-zÀ-ÿ]{4,}[:.,]?$/.test(w.text) && !cache(w));
+    // Dix repères répartis sur la page : les plus sûrs, deux au plus par bande horizontale, sans répéter un mot.
+    const bandes = new Map(), pris = [], vus = new Set();
+    mots.sort((a, b) => (b.conf || 0) - (a.conf || 0)).forEach((w) => {
+      const k = Math.floor(((w.bbox.y0 + w.bbox.y1) / 2 / H) * 10), t = norm(w.text);
+      if ((bandes.get(k) || 0) >= 2 || vus.has(t) || pris.length >= 10) return;
+      bandes.set(k, (bandes.get(k) || 0) + 1); vus.add(t); pris.push(w);
+    });
+    return pris.map((w) => ({ texte: w.text.replace(/[:.,]$/, ""), x: (w.bbox.x0 + w.bbox.x1) / 2 / W, y: (w.bbox.y0 + w.bbox.y1) / 2 / H }));
+  }
+  function verifierCadre(cadre, pages) {
+    const reperes = reperesDe(cadre.modele);
+    if (reperes.length < 4) return; // trop peu de mots imprimés pour juger
+    const rate = pages.some((p) => {
+      if (!p.lines || p.kOff) return false;
+      const W = p.img.width, H = p.img.height, mots = p.lines.flatMap((l) => l.words);
+      const trouves = reperes.filter((r) => mots.some((w) => K.ressemble(w.text.replace(/[:.,]$/, ""), r.texte) &&
+        Math.hypot((w.bbox.x0 + w.bbox.x1) / 2 / W - r.x, (w.bbox.y0 + w.bbox.y1) / 2 / H - r.y) < 0.06)).length;
+      return (reperes.length - trouves) / reperes.length >= 0.4;
+    });
+    if (!rate) return;
+    $("cadreReprendre").textContent = pages.some((p) => p.name === "photo") ? "Reprendre la photo" : "Choisir un autre fichier";
+    $("cadrebar").hidden = false;
+  }
+  function ajouterDocument(viaCamera) {
+    closeSheet();
+    S.cadreDoc = $("optMemeForme").checked && page() ? { modele: page() } : null;
+    if (viaCamera) ouvrirCamera(); else $("inFile").click();
+  }
+  $("cadreReprendre").addEventListener("click", () => {
+    const c = S.cadreDoc; $("cadrebar").hidden = true;
+    if (!c || !c.dernier) return;
+    S.pages = S.pages.filter((p) => !c.dernier.includes(p)); S.cur = Math.max(0, Math.min(S.cur, S.pages.length - 1));
+    changed(); updateUI(); fitView(); render();
+    if (c.dernier.some((p) => p.name === "photo")) ouvrirCamera(); else $("inFile").click();
+  });
+  $("cadreDesactiver").addEventListener("click", () => {
+    const c = S.cadreDoc; $("cadrebar").hidden = true;
+    if (c && c.dernier) c.dernier.forEach((p) => { p.strokes = p.strokes.filter((st) => !st.report); });
+    S.cadreDoc = null; $("optMemeForme").checked = false;
+    afterEdit(); setStatus("Cadre désactivé : ce document est traité comme un nouveau document.", true);
+  });
+  ["cadrebar", "ajoutDoc"].forEach((id) => $(id).addEventListener("pointerdown", (e) => e.stopPropagation()));
+  $("ajoutDoc").addEventListener("click", () => { openSheet(); setStatus("Ajoutez un document : vos noms désignés et vos étiquettes renommées le suivent.", true); });
+
+  // Dans l'appareil photo : le document précédent en transparence, et ses zones effacées, pour se caler dessus.
+  function dessinerCadreCamera() {
+    const cvs = $("camCadre"), v = $("camVideo"), c = S.cadreDoc;
+    if (!c || !c.modele || !v.videoWidth) { cvs.hidden = true; return; }
+    const r = cvs.getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
+    cvs.width = Math.round(r.width * dpr); cvs.height = Math.round(r.height * dpr);
+    const x = cvs.getContext("2d"); x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, r.width, r.height);
+    const s = Math.min(r.width / v.videoWidth, r.height / v.videoHeight), vw = v.videoWidth * s, vh = v.videoHeight * s;
+    const m = c.modele, k = Math.min(vw / m.img.width, vh / m.img.height);
+    const ox = (r.width - m.img.width * k) / 2, oy = (r.height - m.img.height * k) / 2;
+    x.globalAlpha = 0.3; x.drawImage(m.img, ox, oy, m.img.width * k, m.img.height * k);
+    x.globalAlpha = 0.9; x.strokeStyle = "#ffd34d"; x.lineWidth = 2; x.setLineDash([8, 6]);
+    x.strokeRect(ox, oy, m.img.width * k, m.img.height * k);
+    x.strokeStyle = "#ff5a5a"; x.setLineDash([]);
+    m.strokes.forEach((st) => { const b = cadreDe(st); x.strokeRect(ox + b.x * k, oy + b.y * k, b.w * k, b.h * k); });
+    cvs.hidden = false;
+  }
+  $("camVideo").addEventListener("loadedmetadata", dessinerCadreCamera);
+  window.addEventListener("resize", () => { if (!$("camView").hidden) dessinerCadreCamera(); });
+
+  /* ------------- caméra intégrée : la photo reste sur l'ardoise, jamais dans la galerie */
+  let flux = null;
+  const piste = () => (flux ? flux.getVideoTracks()[0] : null);
+  const VIDEO = { width: { ideal: 4096 }, height: { ideal: 3072 } };
+
+  // Sur les téléphones à plusieurs objectifs, on évite l'ultra grand-angle (souvent sans mise au point) :
+  // on préfère l'objectif arrière principal, en général le premier listé (« camera2 0, facing back »).
+  async function meilleureCameraArriere() {
+    try {
+      const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+      const arriere = cams.filter((d) => /back|arri|rear|environment/i.test(d.label));
+      if (!arriere.length) return null;
+      const num = (d) => { const m = d.label.match(/camera2?\s*(\d+)/i); return m ? +m[1] : 99; };
+      return arriere.sort((x, y) => num(x) - num(y))[0].deviceId;
+    } catch (e) { return null; }
+  }
+
+  async function reglerMiseAuPoint() {
+    const t = piste(); if (!t || !t.getCapabilities) return;
+    const cap = t.getCapabilities();
+    const avance = {};
+    if (cap.focusMode && cap.focusMode.includes("continuous")) avance.focusMode = "continuous";
+    if (cap.exposureMode && cap.exposureMode.includes("continuous")) avance.exposureMode = "continuous";
+    if (cap.whiteBalanceMode && cap.whiteBalanceMode.includes("continuous")) avance.whiteBalanceMode = "continuous";
+    if (Object.keys(avance).length) { try { await t.applyConstraints({ advanced: [avance] }); } catch (e) {} }
+    $("camTorch").hidden = !cap.torch;
+  }
+
+  async function ouvrirCamera() {
+    closeSheet();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      // Ce navigateur n'a pas d'accès direct à la caméra : c'est l'appareil photo du téléphone qui prend le relais.
+      $("inCam").click(); return;
+    }
+    try {
+      flux = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, ...VIDEO }, audio: false });
+      // Une fois l'accès accordé, les noms des caméras sont connus : on bascule sur l'objectif principal si besoin.
+      const id = await meilleureCameraArriere();
+      if (id && piste().getSettings().deviceId !== id) {
+        flux.getTracks().forEach((t) => t.stop());
+        flux = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: id }, ...VIDEO }, audio: false });
+      }
+    } catch (e) {
+      // Sans autorisation, l'appareil photo du téléphone ne s'ouvrirait pas non plus (il passe par le navigateur) : on propose ce qui marche.
+      setStatus("L'appareil photo n'est pas autorisé. Choisissez plutôt une photo déjà prise : « Importer une image ou un PDF ». " +
+        "Pour l'autoriser : Paramètres du téléphone → Applications → Chrome → Autorisations → Appareil photo.", true);
+      return;
+    }
+    const v = $("camVideo");
+    v.srcObject = flux;
+    $("camView").hidden = false;
+    torche = false; $("camTorch").setAttribute("aria-pressed", "false");
+    try { await v.play(); } catch (e) {}
+    reglerMiseAuPoint();
+    dessinerCadreCamera();
+  }
+  function fermerCamera() {
+    if (flux) flux.getTracks().forEach((t) => t.stop());
+    flux = null;
+    $("camVideo").srcObject = null;
+    $("camView").hidden = true; $("camCadre").hidden = true;
+  }
+
+  // Toucher l'image : mise au point à cet endroit, quand le téléphone le permet.
+  $("camVideo").addEventListener("click", async (e) => {
+    const t = piste(); if (!t || !t.getCapabilities) return;
+    const cap = t.getCapabilities(), r = e.currentTarget.getBoundingClientRect();
+    const pt = { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+    const anneau = $("camFocus");
+    anneau.style.left = (e.clientX - r.left) + "px"; anneau.style.top = (e.clientY - r.top) + "px";
+    anneau.hidden = false; setTimeout(() => { anneau.hidden = true; }, 900);
+    try {
+      const avance = { pointsOfInterest: [pt] };
+      if (cap.focusMode && cap.focusMode.includes("single-shot")) avance.focusMode = "single-shot";
+      await t.applyConstraints({ advanced: [avance] });
+      setTimeout(reglerMiseAuPoint, 1500); // puis retour à la mise au point continue
+    } catch (err) {}
+  });
+
+  let torche = false;
+  $("camTorch").addEventListener("click", async () => {
+    const t = piste(); if (!t) return;
+    torche = !torche;
+    try { await t.applyConstraints({ advanced: [{ torch: torche }] }); } catch (e) { torche = false; }
+    $("camTorch").setAttribute("aria-pressed", torche ? "true" : "false");
+  });
+
+  $("camShot").addEventListener("click", async () => {
+    const v = $("camVideo");
+    if (!v.videoWidth) return;
+    $("camShot").disabled = true;
+    let c = null, source = null;
+    // Une vraie photo (meilleure netteté) si le téléphone le permet, sinon une image de la vidéo.
+    // Dans les deux cas, elle reste en mémoire : rien n'est écrit sur le téléphone.
+    try {
+      if ("ImageCapture" in window) {
+        const blob = await new ImageCapture(piste()).takePhoto();
+        const im = await createImageBitmap(blob);
+        c = toCanvas(im, im.width, im.height); source = sourceDe(blob, im.width, c); im.close && im.close();
+      }
+    } catch (e) { c = null; }
+    if (!c) c = toCanvas(v, v.videoWidth, v.videoHeight);
+    $("camShot").disabled = false;
+    fermerCamera();
+    estUnProfil(c).then((profil) => { if (!profil) addPages([newPage(c, "photo", source)]); });
+  });
+  $("camSysteme").addEventListener("click", () => {
+    fermerCamera();
+    $("inCam").click();
+  });
+  $("camCancel").addEventListener("click", () => { fermerCamera(); if (!S.pages.length) quitter(); });
+  $("camImport").addEventListener("click", () => { fermerCamera(); $("inFile").click(); });
+  $("btnCam").addEventListener("click", () => ajouterDocument(true));
+  $("emptyCam").addEventListener("click", ouvrirCamera);
+  $("btnFile").addEventListener("click", () => ajouterDocument(false));
+  $("emptyFile").addEventListener("click", () => $("inFile").click());
+
+  // Réglages gardés sur l'appareil : le style des masques, les boutons en miroir, l'appareil photo à l'ouverture.
+  const lireReglage = (cle, defaut) => { try { const v = localStorage.getItem(cle); return v === null ? defaut : v; } catch (e) { return defaut; } };
+  const ecrireReglage = (cle, v) => { try { localStorage.setItem(cle, v); } catch (e) {} };
+  $({ auto: "styleAuto", papier: "stylePapier", flou: "styleFlou", noir: "styleNoir" }[styleMasque]).checked = true;
+  document.querySelectorAll('input[name="style"]').forEach((r) => r.addEventListener("change", () => {
+    styleMasque = r.value; ecrireReglage("kerckhoffs-style", r.value); changed(); render(); majStyleChip();
+  }));
+  $("langueDoc").value = langueDoc;
+  $("langueDoc").addEventListener("change", () => {
+    langueDoc = $("langueDoc").value === "en" ? "en" : "fr";
+    ecrireReglage("kerckhoffs-langue-doc", langueDoc);
+    attribuerJetons(); changed(); render(); renderLegend();
+  });
+  const majGaucher = () => $("work").classList.toggle("gaucher", $("optGaucher").checked);
+  $("optGaucher").checked = lireReglage("kerckhoffs-gaucher", "0") === "1"; majGaucher();
+  $("optGaucher").addEventListener("change", () => { ecrireReglage("kerckhoffs-gaucher", $("optGaucher").checked ? "1" : "0"); majGaucher(); });
+  const estTelephone = () => matchMedia("(pointer: coarse)").matches;
+  $("camDirecteBloc").hidden = !estTelephone();
+  $("optCamDirecte").checked = lireReglage("kerckhoffs-camera-directe", "1") === "1";
+  $("optCamDirecte").addEventListener("change", () => ecrireReglage("kerckhoffs-camera-directe", $("optCamDirecte").checked ? "1" : "0"));
+
+  // Le menu : un panneau qui monte du bas de l'écran (sur un grand écran, il se range sur le côté)
+  function openSheet() { $("sheet").hidden = false; $("backdrop").hidden = false; majPanneau(); }
+  function closeSheet() { $("sheet").hidden = true; $("backdrop").hidden = true; majPanneau(); }
+  // Sur un grand écran, le menu et la liste Remove Before Flight se rangent à droite : la feuille se décale pour rester visible.
+  function majPanneau() {
+    const large = matchMedia("(min-width: 900px)").matches;
+    const ouvert = large && (!$("sheet").hidden || !$("cerbere").hidden);
+    if ($("work").classList.contains("panneau") === ouvert) return;
+    const v = S.view, aLaVueEntiere = !v.fit || Math.abs(v.s - v.fit) < 0.001;
+    $("work").classList.toggle("panneau", ouvert);
+    if (page() && aLaVueEntiere) { fitView(); render(); }
+  }
+  $("btnOpts").addEventListener("click", openSheet);
+  $("closeSheet").addEventListener("click", closeSheet);
+  $("backdrop").addEventListener("click", () => { closeSheet(); if (!$("cerbere").hidden) fermerCerbere(); });
+  // L'appareil photo du téléphone (et non celui de Kerckhoffs) peut ranger la photo dans la galerie : une phrase le rappelle.
+  const PHRASE_GALERIE = "Contrôlez votre galerie : la photo a peut-être été enregistrée par l'appareil photo.";
+  $("inCam").addEventListener("change", (e) => { if (e.target.files.length) S.galerie = true; addFiles([...e.target.files]); e.target.value = ""; });
+  $("inFile").addEventListener("change", (e) => { addFiles([...e.target.files]); e.target.value = ""; });
+
+  /* -------------------------------------------------------- affichage */
+  function applyView() {
+    const v = S.view;
+    cv.style.transform = `translate(${v.tx}px, ${v.ty}px) scale(${v.s})`;
+  }
+  // Le bouton « Ajuster » apparaît dès que l'image n'est plus en vue entière.
+  function showFit() {
+    const v = S.view;
+    const atFit = Math.abs(v.s - v.fit) < 0.001 && Math.abs(v.tx - v.tx0) < 1 && Math.abs(v.ty - v.ty0) < 1;
+    $("fit").hidden = !page() || atFit;
+    $("chercherIci").hidden = !page() || v.s < v.fit * 1.3;
+  }
+  function fitView() {
+    const p = page(); if (!p) return;
+    cv.width = p.img.width; cv.height = p.img.height;
+    const r = $("viewport").getBoundingClientRect();
+    const s = Math.min(r.width / p.img.width, r.height / p.img.height);
+    S.view = { s, tx: (r.width - p.img.width * s) / 2, ty: (r.height - p.img.height * s) / 2, fit: s };
+    S.view.tx0 = S.view.tx; S.view.ty0 = S.view.ty;
+    applyView(); $("fit").hidden = true; $("chercherIci").hidden = true;
+  }
+
+  /* Ce qui recouvre les données : du noir, ou un « flou opaque », un aplat de la couleur moyenne de la zone.
+   * Dans les deux cas, il n'y a plus rien dessous : la copie envoyée est une image neuve. */
+  const lumDe = (rgb) => { const m = /(\d+),\s*(\d+),\s*(\d+)/.exec(rgb || ""); return m ? 0.299 * m[1] + 0.587 * m[2] + 0.114 * m[3] : 0; };
+  function moyenne(img, r) {
+    const sx = Math.max(0, Math.floor(r.x)), sy = Math.max(0, Math.floor(r.y));
+    const sw = Math.max(1, Math.min(img.width - sx, Math.ceil(r.w))), sh = Math.max(1, Math.min(img.height - sy, Math.ceil(r.h)));
+    const c = document.createElement("canvas"); c.width = 16; c.height = 16;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    x.imageSmoothingQuality = "high";
+    try { x.drawImage(img, sx, sy, sw, sh, 0, 0, 16, 16); } catch (e) { return "rgb(128,128,128)"; }
+    const d = x.getImageData(0, 0, 16, 16).data; let R = 0, G = 0, B = 0;
+    for (let i = 0; i < d.length; i += 4) { R += d[i]; G += d[i + 1]; B += d[i + 2]; }
+    const n = d.length / 4;
+    // un peu plus sombre que la moyenne : la tache se voit, même sur du papier blanc
+    return `rgb(${Math.round(R / n * 0.84)},${Math.round(G / n * 0.84)},${Math.round(B / n * 0.84)})`;
+  }
+  const cadreDe = (st) => {
+    if (st.kind === "rect") return st;
+    const xs = st.pts.map((q) => q[0]), ys = st.pts.map((q) => q[1]), m = st.w / 2;
+    return { x: Math.min(...xs) - m, y: Math.min(...ys) - m, w: Math.max(...xs) - Math.min(...xs) + st.w, h: Math.max(...ys) - Math.min(...ys) + st.w };
+  };
+  /* La couleur du papier autour d'une zone : la couleur la plus fréquente sur un anneau autour d'elle.
+   * L'encre est minoritaire autour d'un mot : on retrouve le fond, qu'il soit blanc, jaune, gris, sombre (mode sombre) ou coloré (une case de tableau). */
+  function papierDe(img, r) {
+    const m = Math.max(4, Math.min(r.w, r.h) * 0.6);
+    const X0 = Math.max(0, r.x - m), Y0 = Math.max(0, r.y - m), X1 = Math.min(img.width, r.x + r.w + m), Y1 = Math.min(img.height, r.y + r.h + m);
+    const k = Math.min(1, 64 / Math.max(1, X1 - X0, Y1 - Y0));
+    const W = Math.max(1, Math.round((X1 - X0) * k)), H = Math.max(1, Math.round((Y1 - Y0) * k));
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    try { x.drawImage(img, X0, Y0, X1 - X0, Y1 - Y0, 0, 0, W, H); } catch (e) { return "rgb(245,245,245)"; }
+    const d = x.getImageData(0, 0, W, H).data;
+    const ix0 = (r.x - X0) * k, iy0 = (r.y - Y0) * k, ix1 = (r.x + r.w - X0) * k, iy1 = (r.y + r.h - Y0) * k;
+    const seaux = new Map();
+    const ajouter = (o) => { const cle = (d[o] >> 4) * 256 + (d[o + 1] >> 4) * 16 + (d[o + 2] >> 4); const s = seaux.get(cle) || [0, 0, 0, 0]; s[0] += d[o]; s[1] += d[o + 1]; s[2] += d[o + 2]; s[3]++; seaux.set(cle, s); };
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) if (i < ix0 || i >= ix1 || j < iy0 || j >= iy1) ajouter((j * W + i) * 4);
+    if (!seaux.size) for (let i = 0; i < W * H; i++) ajouter(i * 4);
+    let best = null; for (const s of seaux.values()) if (!best || s[3] > best[3]) best = s;
+    return `rgb(${Math.round(best[0] / best[3])},${Math.round(best[1] / best[3])},${Math.round(best[2] / best[3])})`;
+  }
+  // Le style de la page : en automatique, papier pour un document (lettre, formulaire, capture d'écran), flou opaque pour une photo.
+  const styleDe = (p) => (p && p.styleForce) || (styleMasque === "auto" ? (p && p.genre === "photo" ? "flou" : "papier") : styleMasque);
+  // La couleur d'un masque, calculée une fois sur l'image d'origine.
+  function couleurDe(o, p) {
+    const s = styleDe(p);
+    if (s === "noir" || !p) return "#000";
+    if (o.moyImg !== p.img || o.moyStyle !== s || !o.moy) {
+      const r = o.kind ? cadreDe(o) : o;
+      o.moy = s === "papier" ? papierDe(p.img, o.etiq ? unionDe(o.etiq.rects.concat([r])) : r) : moyenne(p.img, r);
+      o.moyImg = p.img; o.moyStyle = s;
+    }
+    return o.moy;
+  }
+  const texteSur = (fond) => (fond === "#000" || lumDe(fond) < 140 ? "#fff" : "#3d4650");
+
+  // Un élément dessiné : un trait au doigt { kind:"line", w, pts } ou un rectangle { kind:"rect", x, y, w, h }.
+  // Un trait qui a recouvert des mots lus porte aussi leurs cadres (st.etiq) : le mot entier disparaît, et son étiquette s'y inscrit.
+  function strokePath(c, st, couleur) {
+    c.save();
+    c.fillStyle = couleur || "#000"; c.strokeStyle = couleur || "#000";
+    if (st.etiq) st.etiq.rects.forEach((r) => c.fillRect(r.x, r.y, r.w, r.h));
+    if (st.kind === "rect") { c.fillRect(st.x, st.y, st.w, st.h); c.restore(); return; }
+    // Le trait du doigt s'est rangé sur les mots touchés : seuls leurs rectangles exacts restent masqués.
+    if (st.surMots) { c.restore(); return; }
+    c.lineCap = "round"; c.lineJoin = "round"; c.lineWidth = st.w;
+    if (st.pts.length === 1) {
+      c.beginPath(); c.arc(st.pts[0][0], st.pts[0][1], st.w / 2, 0, Math.PI * 2); c.fill();
+    } else {
+      c.beginPath(); c.moveTo(st.pts[0][0], st.pts[0][1]);
+      for (let i = 1; i < st.pts.length; i++) c.lineTo(st.pts[i][0], st.pts[i][1]);
+      c.stroke();
+    }
+    c.restore();
+  }
+
+  // L'étiquette (« [PERSONNE_1] ») s'inscrit dans un cadre, si elle y tient, et jamais par-dessus une autre étiquette.
+  function ecrireEtiquette(c, token, r, fond, deja) {
+    const fs = Math.min(r.h * 0.72, r.w / (token.length * 0.62));
+    if (fs < 7) return;
+    if (deja) {
+      const w = Math.min(r.w, token.length * fs * 0.62), z = { x: r.x + (r.w - w) / 2, y: r.y + (r.h - fs) / 2, w, h: fs };
+      if (deja.some((o) => z.x < o.x + o.w && o.x < z.x + z.w && z.y < o.y + o.h && o.y < z.y + z.h)) return;
+      deja.push(z);
+    }
+    c.save();
+    c.fillStyle = texteSur(fond); c.font = `600 ${fs}px ui-monospace, Menlo, Consolas, monospace`;
+    c.textAlign = "center"; c.textBaseline = "middle";
+    c.fillText(token, r.x + r.w / 2, r.y + r.h / 2, r.w - 4);
+    c.restore();
+  }
+  // Une zone détectée sous un rectangle tracé à la main : pas d'étiquette (le rectangle masque, sans rien dire de ce qu'il cache).
+  const sousRectangle = (p, b) => p && p.strokes.some((st) => st.kind === "rect" && !st.ref &&
+    b.x + b.w / 2 >= st.x && b.x + b.w / 2 <= st.x + st.w && b.y + b.h / 2 >= st.y && b.y + b.h / 2 <= st.y + st.h);
+  function drawBox(c, b, final, p) {
+    const rects = b.rects || [b];
+    c.save();
+    if (b.active) {
+      const fond = couleurDe(b, p);
+      c.fillStyle = fond;
+      rects.forEach((r) => c.fillRect(r.x, r.y, r.w, r.h));
+      const r = rects.reduce((m, x) => (x.w > m.w ? x : m), rects[0]);
+      // Pas d'étiquette sous un rectangle tracé à la main, ni pour une « zone répétée » (elle n'apprendrait rien au lecteur).
+      if (b.etiquettes && !b.sansEtiquette && !sousRectangle(p, b) && !String(b.key).startsWith("ZONE|")) b.etiquettes.push([b.token, r, fond]);
+    } else if (!final) {
+      c.setLineDash([10, 6]); c.lineWidth = Math.max(2, cv.width / 600); c.strokeStyle = "#002366";
+      rects.forEach((r) => c.strokeRect(r.x, r.y, r.w, r.h));
+    }
+    if (!final && b.active && b.flag) {
+      c.lineWidth = Math.max(3, cv.width / 400); c.strokeStyle = "#e08a1e";
+      rects.forEach((r) => c.strokeRect(r.x, r.y, r.w, r.h));
+    }
+    c.restore();
+  }
+
+  function paint(c, p, masked, final) {
+    c.drawImage(p.img, 0, 0);
+    if (!masked) return;
+    p.strokes.forEach((st) => strokePath(c, st, couleurDe(st, p)));
+    const aEcrire = [];
+    p.boxes.forEach((b) => { b.etiquettes = aEcrire; drawBox(c, b, final, p); b.etiquettes = null; });
+    // Ce qui est effacé sans étiquette (le doigt, un rectangle « Masquer ») porte la marque rouge « kerckhoffs.app » :
+    // on voit qu'il y avait là une information, même en couleur papier. Taille fixe, découpée par la zone, comme un ticket à gratter.
+    p.strokes.forEach((st) => { if (!st.ref) marquer(c, p, st); });
+    // Les étiquettes des rectangles nommés passent en premier.
+    const deja = [];
+    p.strokes.forEach((st) => {
+      const e = st.ref || (st.etiq && !st.etiq.marque ? st.etiq : null);
+      if (!e || (st.ref && st.ref.sansEtiquette)) return;
+      const token = st.ref ? jetonTrait(st) : tokenFor(e.key, e.type, e.value);
+      ecrireEtiquette(c, token, st.etiq ? st.etiq.zone || unionDe(st.etiq.rects) : st, couleurDe(st, p), deja);
+    });
+    aEcrire.forEach(([token, r, fond]) => ecrireEtiquette(c, token, r, fond, deja));
+    if (p.kOff) filigraneKOff(c, p);
+  }
+  const MARQUE = "kerckhoffs.app";
+  // Le logo (le K et sa serrure), pour les petites zones où l'adresse ne tiendrait pas.
+  const LOGO_K = new Path2D("M150.0 391.0 L150.8 395.2 L153.2 398.8 L156.8 401.2 L159.9 401.9 L212.1 401.9 L215.2 401.2 L218.8 398.8 L221.2 395.2 L222.0 391.0 L222.2 313.5 L223.8 309.6 L226.0 307.2 L229.7 305.1 L232.8 304.6 L236.0 305.0 L238.0 305.8 L241.5 308.6 L318.7 398.2 L321.1 400.2 L323.9 401.6 L327.0 402.0 L363.9 402.0 L366.1 401.8 L369.2 400.7 L372.5 397.9 L374.2 395.1 L374.9 391.9 L374.7 388.6 L372.9 384.7 L268.2 263.4 L266.3 260.6 L265.3 256.5 L265.9 252.4 L268.2 248.6 L372.9 127.3 L374.7 123.4 L374.8 119.0 L373.2 115.0 L371.0 112.6 L368.2 110.9 L363.9 110.0 L327.0 110.0 L323.9 110.4 L321.1 111.8 L318.7 113.8 L241.5 203.4 L238.0 206.2 L235.0 207.2 L232.8 207.4 L228.7 206.5 L226.0 204.8 L223.3 201.5 L222.1 197.5 L222.0 121.0 L221.2 116.8 L219.5 114.0 L217.1 111.9 L215.2 110.8 L211.0 110.0 L159.9 110.1 L155.8 111.3 L152.5 114.0 L150.8 116.8 L150.0 121.0 Z");
+  function dessinerLogo(c, x, yMilieu, h, fond, couleur) {
+    const k = h / 292; // le K mesure 292 unités de haut dans le dessin d'origine
+    c.save(); c.translate(x - 150 * k, yMilieu - h / 2 - 110 * k); c.scale(k, k);
+    c.fillStyle = couleur || "#d0021b"; c.fill(LOGO_K);
+    c.fillStyle = fond || "#fff"; c.beginPath(); c.arc(186, 240.4, 18, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.moveTo(177, 250); c.lineTo(195, 250); c.lineTo(201, 290); c.lineTo(171, 290); c.closePath(); c.fill();
+    c.restore();
+  }
+  function kOn(c, x, yMilieu, h) {
+    c.save(); c.fillStyle = "#d0021b"; c.font = `800 ${Math.max(6, h * 0.62)}px system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif`;
+    c.textBaseline = "middle"; c.fillText(":ON", x + h * 0.06, yMilieu); c.restore();
+  }
+  /* K:OFF : le logo et « :OFF », en gris très léger, répétés sur toute la page (environ 5 en largeur, 10 en hauteur).
+   * Il ne s'enlève pas dans Kerckhoffs. Il dit que la détection automatique n'a pas pu servir sur cette page. */
+  function filigraneKOff(c, p) {
+    const W = p.img.width, H = p.img.height, h = Math.max(14, Math.round(Math.min(W / 5, H / 10) * 0.32));
+    c.save(); c.globalAlpha = 0.07;
+    c.font = `800 ${Math.round(h * 0.7)}px system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif`;
+    c.textBaseline = "middle"; c.fillStyle = "#5a6872";
+    for (let j = 0; j < 10; j++) for (let i = 0; i < 5; i++) {
+      const x = (i + (j % 2 ? 0.5 : 0.15)) * (W / 5), y = (j + 0.5) * (H / 10);
+      dessinerLogo(c, x, y, h, "rgba(0,0,0,0)", "#5a6872");
+      c.fillText(":OFF", x + h * 0.85, y);
+    }
+    c.restore();
+  }
+  const tailleMarque = (p) => Math.max(14, Math.round(Math.min(p.img.width, p.img.height * 0.75) / 55));
+  function marquer(c, p, st) {
+    const h = tailleMarque(p), fond = couleurDe(st, p);
+    c.save();
+    c.font = `700 ${h}px system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif`;
+    c.fillStyle = "#d0021b"; c.textBaseline = "middle";
+    const ecrire = (x, y) => c.fillText(MARQUE, x, y);
+    if (st.kind === "rect" || (st.etiq && st.surMots)) {
+      // Un mot déjà masqué par la détection garde son étiquette : pas de marque par-dessus.
+      const dejaMasque = (r) => p.boxes.some((b) => b.active && (b.rects || [b]).some((q) => r.x + r.w / 2 >= q.x && r.x + r.w / 2 <= q.x + q.w && r.y + r.h / 2 >= q.y && r.y + r.h / 2 <= q.y + q.h));
+      const rects = st.kind === "rect" ? [st] : st.etiq.rects.filter((r) => !dejaMasque(r));
+      // Une ligne de mots = une marque, qui commence au début de la ligne.
+      const lignes = [];
+      rects.forEach((r) => {
+        const l = lignes.find((x) => Math.abs((x.y + x.h / 2) - (r.y + r.h / 2)) < Math.min(x.h, r.h) * 0.5);
+        if (l) l.rects.push(r); else lignes.push({ y: r.y, h: r.h, rects: [r] });
+      });
+      const largeurTexte = c.measureText(MARQUE).width;
+      lignes.forEach((l) => {
+        c.save(); c.beginPath(); l.rects.forEach((r) => c.rect(r.x, r.y, r.w, r.h)); c.clip();
+        const u = unionDe(l.rects);
+        // Petite zone : le logo se découvre à la place de l'adresse, avec « :ON » en petit (Kerckhoffs a fonctionné).
+        if (u.w < largeurTexte * 0.55) { const hl = Math.min(h, u.h * 0.9), x0 = u.x + Math.max(2, (u.w - hl * 1.9) / 2); dessinerLogo(c, x0, u.y + u.h / 2, hl, fond); if (!p.kOff) kOn(c, x0 + hl * 0.8, u.y + u.h / 2, hl); }
+        else ecrire(u.x + h * 0.2, u.y + u.h / 2);
+        c.restore();
+      });
+    } else if (st.kind === "line" && st.pts.length) {
+      // Trait libre (signature, visage…) : la marque n'apparaît que là où le doigt est passé.
+      const xs = st.pts.map((q) => q[0]), ys = st.pts.map((q) => q[1]), m = st.w / 2 + 2;
+      const bx = Math.floor(Math.min(...xs) - m), by = Math.floor(Math.min(...ys) - m);
+      const bw = Math.ceil(Math.max(...xs) + m) - bx, bh = Math.ceil(Math.max(...ys) + m) - by;
+      if (bw > 0 && bh > 0) {
+        const o = document.createElement("canvas"); o.width = bw; o.height = bh;
+        const x = o.getContext("2d");
+        x.font = c.font; x.fillStyle = "#d0021b"; x.textBaseline = "middle";
+        const tw = x.measureText(MARQUE).width + h;
+        if (bw < tw) { // petite zone : des logos (avec « :ON ») qui se découvrent sous le doigt
+          const pasX = p.kOff ? h * 1.1 : h * 2.1;
+          for (let yy = h / 2; yy < bh + h; yy += h * 1.2) for (let xx = 0; xx < bw + h; xx += pasX) { dessinerLogo(x, xx, yy, h, fond); if (!p.kOff) kOn(x, xx + h * 0.8, yy, h); }
+        } else
+        for (let yy = h / 2; yy < bh + h; yy += h * 1.8) for (let xx = (yy / h) % 2 ? 0 : -tw / 2; xx < bw; xx += tw) x.fillText(MARQUE, xx, yy);
+        x.globalCompositeOperation = "destination-in";
+        x.translate(-bx, -by); strokePath(x, { kind: "line", w: st.w, pts: st.pts }, "#000");
+        c.drawImage(o, bx, by);
+      }
+    }
+    c.restore();
+  }
+  const unionDe = (rects) => {
+    const x0 = Math.min(...rects.map((r) => r.x)), y0 = Math.min(...rects.map((r) => r.y));
+    return { x: x0, y: y0, w: Math.max(...rects.map((r) => r.x + r.w)) - x0, h: Math.max(...rects.map((r) => r.y + r.h)) - y0 };
+  };
+  function render() {
+    majFiligrane();
+    const p = page(); if (!p) return;
+    paint(ctx, p, true, false);
+    if (S.cadre && S.cadre.page === p) dessinerCadre(S.cadre.rect);
+    // Point signalé par Cerbère : encadré en orange.
+    if (S.flash && S.flash.page === p) {
+      ctx.save(); ctx.lineWidth = Math.max(4, cv.width / 300); ctx.strokeStyle = "#ff7a00"; ctx.fillStyle = "rgba(255,122,0,.18)";
+      S.flash.rects.forEach((r) => { ctx.fillRect(r.x, r.y, r.w, r.h); ctx.strokeRect(r.x, r.y, r.w, r.h); });
+      ctx.restore();
+    }
+    // Zone sélectionnée au rectangle : en surbrillance, en attente d'un choix.
+    if (S.sel && S.sel.page === p) {
+      const r = S.sel.rect;
+      ctx.save();
+      ctx.fillStyle = "rgba(60,110,230,.28)"; ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.setLineDash([12, 8]); ctx.lineWidth = Math.max(3, cv.width / 400); ctx.strokeStyle = "#2b5fe0";
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+      ctx.restore();
+      poignees(r, "#2b5fe0");
+    }
+    if (S.cadre && S.cadre.page === p) poignees(S.cadre.rect, "#ffffff");
+    dessinerGroupes();
+    // Zones d'écriture non lues, pendant le contrôle Remove Before Flight : en orange, en pointillés.
+    if (S.orange) {
+      ctx.save(); ctx.setLineDash([14, 8]); ctx.lineWidth = Math.max(3, cv.width / 350); ctx.strokeStyle = "#e08a1e"; ctx.fillStyle = "rgba(224,138,30,.12)";
+      S.orange.filter((o) => o.page === S.cur).forEach((o) => o.rects.forEach((r) => { ctx.fillRect(r.x, r.y, r.w, r.h); ctx.strokeRect(r.x, r.y, r.w, r.h); }));
+      ctx.restore();
+    }
+    // Éléments qui viennent d'être trouvés : ils scintillent quelques secondes, pour qu'on aille les vérifier.
+    if (S.trouves) {
+      const T = S.trouves, t = (performance.now() - T.t0) / 1000;
+      const eclat = t < 6 ? 0.55 + 0.45 * Math.sin(t * 7) : 0.9;
+      ctx.save();
+      T.items.forEach((it, i) => {
+        if (it.page !== S.cur) return;
+        const courant = i === T.i;
+        ctx.globalAlpha = courant ? 1 : eclat;
+        ctx.lineWidth = Math.max(courant ? 6 : 4, cv.width / (courant ? 220 : 320));
+        ctx.strokeStyle = courant ? "#ffd400" : "#ffc400";
+        ctx.shadowColor = "#ffe066"; ctx.shadowBlur = courant ? 18 : 10;
+        it.rects.forEach((r) => {
+          const m = ctx.lineWidth;
+          ctx.strokeRect(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m);
+          // petite étincelle au coin
+          const cx = r.x + r.w + m, cy = r.y - m, a = Math.max(6, cv.width / 140) * (courant ? 1.3 : 1);
+          ctx.beginPath(); ctx.moveTo(cx, cy - a); ctx.lineTo(cx + a * 0.25, cy - a * 0.25); ctx.lineTo(cx + a, cy); ctx.lineTo(cx + a * 0.25, cy + a * 0.25);
+          ctx.lineTo(cx, cy + a); ctx.lineTo(cx - a * 0.25, cy + a * 0.25); ctx.lineTo(cx - a, cy); ctx.lineTo(cx - a * 0.25, cy - a * 0.25); ctx.closePath();
+          ctx.fillStyle = "#ffd400"; ctx.fill();
+        });
+      });
+      ctx.restore();
+    }
+  }
+  // Les quatre coins d'une sélection : on les tire pour l'agrandir, on glisse l'intérieur pour la déplacer.
+  function poignees(r, couleur) {
+    const t = 11 / S.view.s;
+    ctx.save(); ctx.lineWidth = 3 / S.view.s; ctx.fillStyle = couleur; ctx.strokeStyle = "#002366";
+    for (const [x, y] of [[r.x, r.y], [r.x + r.w, r.y], [r.x, r.y + r.h], [r.x + r.w, r.y + r.h]]) {
+      ctx.beginPath(); ctx.arc(x, y, t, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  // Le doigt touche-t-il un coin, l'intérieur, ou rien ?
+  function prise(r, x, y) {
+    const t = 26 / S.view.s;
+    const coins = [[r.x, r.y, "hg"], [r.x + r.w, r.y, "hd"], [r.x, r.y + r.h, "bg"], [r.x + r.w, r.y + r.h, "bd"]];
+    const c = coins.find(([cx, cy]) => Math.hypot(x - cx, y - cy) <= t);
+    if (c) return c[2];
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return "milieu";
+    return null;
+  }
+
+  /* ---------------------- doigt : pinceau, rectangle, gomme, zoom, retour */
+  const ptrs = new Map();
+  let draft = null, moved = false, downAt = null, pinch = null;
+  let tool = "brush", espace = false;
+  const history = []; // actions à annuler : { type:"add"|"remove"|"toggle", page, item, index }
+
+  function toImg(cx, cy) {
+    const r = $("viewport").getBoundingClientRect();
+    return [(cx - r.left - S.view.tx) / S.view.s, (cy - r.top - S.view.ty) / S.view.s];
+  }
+  const brushW = () => (+$("brush").value / 100) * Math.max(320, Math.min(cv.width, cv.height));
+
+  // Deux modes de base, aux coins : déplacer la feuille (la croix) ou effacer au doigt.
+  // Rectangle, Gomme et Recadrer s'ouvrent depuis le menu, le temps d'un geste, puis on revient au mode de base.
+  let outilBase = "brush";
+  const AIDES = {
+    move: "Un doigt : faire glisser la feuille. Deux doigts : zoomer. « Ajuster » revient à la vue entière.",
+    brush: "Passez le doigt sur ce qui doit disparaître. Deux doigts : zoomer et déplacer.",
+    crop: "Zoomez et déplacez avec deux doigts pour ne voir que la feuille, puis touchez « Garder ce qui est à l'écran ». Ou glissez en diagonale autour de la feuille.",
+    rect: "Glissez en diagonale sur une zone. Puis : la masquer, retrouver tous les pareils, ou dire ce que c'est (Référencer).",
+    erase: "Touchez une zone masquée pour la faire réapparaître.",
+  };
+  const MODES = { rect: "Rectangle", crop: "Recadrer", erase: "Gomme : touchez ce qui doit réapparaître" };
+  function setTool(v, silencieux) {
+    tool = v;
+    if (v === "brush" || v === "move") outilBase = v;
+    if (S.sel && v !== "rect") unselect();
+    if (S.cadre && v !== "crop") annulerCadre();
+    $("refbar").hidden = true;
+    $("coinDoigt").setAttribute("aria-pressed", String(v === "brush"));
+    $("coinMove").setAttribute("aria-pressed", String(v === "move"));
+    $("modeChip").hidden = !MODES[v] || !page();
+    $("modeTexte").textContent = MODES[v] || "";
+    $("cropScreen").hidden = v !== "crop" || !page();
+    if (page() && !silencieux) setStatus(AIDES[v]);
+  }
+  const finGeste = () => setTool(outilBase, true);
+  $("styleChip").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("styleChip").addEventListener("click", () => {
+    const p = page(); if (!p) return;
+    const suite = { papier: "flou", flou: "noir", noir: "papier" };
+    p.styleForce = suite[styleDe(p)];
+    changed(); render(); majStyleChip();
+    setStatus("Pour cette page : " + { papier: "couleur du papier", flou: "flou opaque", noir: "noir" }[p.styleForce] + ". Touchez encore pour changer.");
+  });
+  $("coinDoigt").addEventListener("click", () => setTool("brush"));
+  $("coinMove").addEventListener("click", () => setTool("move"));
+  $("modeFin").addEventListener("click", () => { if (relier) finirRelier(); else setTool(outilBase); });
+  $("modeChip").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("mRect").addEventListener("click", () => { closeSheet(); setTool("rect"); });
+  $("mGomme").addEventListener("click", () => { closeSheet(); setTool("erase"); });
+  $("mRecadrer").addEventListener("click", () => { closeSheet(); setTool("crop"); });
+  $("mChercher").addEventListener("click", () => { closeSheet(); chercherIci(); });
+  ["undo", "coinMove", "coinDoigt", "btnOpts", "pages", "empty"].forEach((id) => $(id).addEventListener("pointerdown", (e) => e.stopPropagation()));
+
+  function distSeg(px, py, a, b) {
+    const dx = b[0] - a[0], dy = b[1] - a[1], l = dx * dx + dy * dy;
+    const t = l ? Math.max(0, Math.min(1, ((px - a[0]) * dx + (py - a[1]) * dy) / l)) : 0;
+    return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
+  }
+  function hitItem(p, x, y) {
+    const tol = 14 / S.view.s; // tolérance du doigt, en pixels d'image
+    for (let i = p.strokes.length - 1; i >= 0; i--) {
+      const st = p.strokes[i];
+      if (st.kind === "rect") {
+        if (x >= st.x - tol && x <= st.x + st.w + tol && y >= st.y - tol && y <= st.y + st.h + tol) return i;
+      } else if (st.pts.length === 1) {
+        if (Math.hypot(x - st.pts[0][0], y - st.pts[0][1]) <= st.w / 2 + tol) return i;
+      } else {
+        for (let k = 1; k < st.pts.length; k++) if (distSeg(x, y, st.pts[k - 1], st.pts[k]) <= st.w / 2 + tol) return i;
+      }
+    }
+    return -1;
+  }
+  const hitBox = (p, x, y) => {
+    const t = 8 / S.view.s;
+    return [...p.boxes].reverse().find((b) => (b.rects || [b]).some((r) => x >= r.x - t && x <= r.x + r.w + t && y >= r.y - t && y <= r.y + r.h + t));
+  };
+
+  // Toucher une zone masquée ouvre la barre « C'est : un nom · une adresse · un numéro ou code · autre… ».
+  // Toucher une zone démasquée (pointillés) la masque de nouveau.
+  function hitEtiq(p, x, y) {
+    const t = 8 / S.view.s;
+    for (let i = p.strokes.length - 1; i >= 0; i--) {
+      const st = p.strokes[i];
+      if (st.etiq && st.etiq.rects.some((r) => x >= r.x - t && x <= r.x + r.w + t && y >= r.y - t && y <= r.y + r.h + t)) return st;
+    }
+    return null;
+  }
+  function toucherEtiquette(p, x, y) {
+    if (relier) {
+      const b = hitBox(p, x, y), r = b && b.active ? null : trouverRef(p, x, y);
+      if (b && b.active) basculerRelier({ page: p, box: b }); else if (r) basculerRelier({ page: p, stroke: r });
+      return true;
+    }
+    const st = hitEtiq(p, x, y);
+    if (st) { ouvrirEtiq({ page: p, stroke: st }); return true; }
+    const b = hitBox(p, x, y);
+    if (!b) return false;
+    if (b.active) ouvrirEtiq({ page: p, box: b });
+    else { toggleBox(p, b); afterEdit(); }
+    return true;
+  }
+  let etiqCible = null, etiqMode = null;
+  const etiqJeton = (c) => (c.box ? c.box.token : tokenFor(c.stroke.etiq.key, c.stroke.etiq.type, c.stroke.etiq.value));
+  const etiqValeur = (c) => String(c.box ? c.box.words.map((w) => w.text).join(" ") : c.stroke.etiq.value || "").replace(/^[\s,;:.()]+|[\s,;:.()]+$/g, "");
+  function ouvrirEtiq(c) {
+    etiqCible = c; etiqMode = null;
+    $("selbar").hidden = true; $("refbar").hidden = true;
+    const doigt = !!c.stroke;
+    document.querySelectorAll("#etiqbar [data-etiq], #etiqAutre, #etiqRenommer, #etiqRelier").forEach((b) => { b.hidden = doigt; });
+    $("etiqDetacher").hidden = doigt || !(S.groupes && c.box && S.groupes.has(c.box.occ));
+    $("etiqTitre").textContent = doigt ? "Effacé au doigt :" : `${etiqJeton(c)} : c'est`;
+    $("etiqSaisie").hidden = true; $("etiqAide").hidden = true;
+    $("etiqbar").hidden = false;
+    setStatus(c.stroke ? "Effacé au doigt. Pour nommer une donnée, encadrez-la plutôt avec le rectangle." :
+      c.box && c.box.source ? `Masqué par ${c.box.source}. Choisissez ce que c'est, ou rendez-le visible.` : "Choisissez ce que c'est, ou rendez-le visible.", true);
+  }
+  function fermerEtiq() { etiqCible = null; etiqMode = null; $("etiqbar").hidden = true; }
+  function rectDeCible(c) {
+    if (c.box) return unionDe(c.box.rects || [c.box]);
+    return c.stroke.etiq.zone || unionDe(c.stroke.etiq.rects);
+  }
+  // Un nom collé à un nom déjà trouvé, sur la même ligne : il rejoint son étiquette.
+  function voisinPersonne(c) {
+    const r = rectDeCible(c), p = c.page;
+    const proche = (o) => {
+      const h = Math.min(r.h, o.h), recouvre = Math.min(r.y + r.h, o.y + o.h) - Math.max(r.y, o.y);
+      const ecart = Math.max(o.x - (r.x + r.w), r.x - (o.x + o.w));
+      return recouvre >= h * 0.5 && ecart <= Math.max(r.h, o.h) * 1.5;
+    };
+    const b = p.boxes.find((x) => x !== c.box && x.active && String(x.key).startsWith("PERSONNE|") && proche(unionDe(x.rects || [x])));
+    if (b) return b.key;
+    const s = p.strokes.find((x) => x !== c.stroke && x.etiq && x.etiq.type === "PERSONNE" && proche(x.etiq.zone || unionDe(x.etiq.rects)));
+    return s ? s.etiq.key : null;
+  }
+  function choisirType(type, libelle) {
+    const c = etiqCible; if (!c) return;
+    const valeur = etiqValeur(c);
+    if (!valeur) { fermerEtiq(); return; }
+    let key = type + "|" + norm(valeur);
+    if (type === "PERSONNE") key = voisinPersonne(c) || key;
+    if (c.stroke) { c.stroke.etiq.type = type; c.stroke.etiq.key = key; c.stroke.etiq.value = valeur; }
+    S.choisis = (S.choisis || []).filter((t) => norm(t.value) !== norm(valeur));
+    S.choisis.push({ type, value: valeur, key, origine: `votre choix (« ${libelle} »)` });
+    fermerEtiq();
+    S.tokens = new Map(); S.counters = {};
+    S.pages.forEach((q) => { if (q.lines) detect(q); });
+    changed(); render(); renderLegend();
+    setStatus(`« ${valeur} » : ${libelle}, partout où il apparaît. Chaque endroit garde sa propre lettre ; pour en relier plusieurs, touchez-en un, puis « Relier… ».`, true);
+  }
+  document.querySelectorAll("#etiqbar [data-etiq]").forEach((b) => b.addEventListener("click", () => choisirType(b.dataset.etiq, b.textContent)));
+  function ouvrirSaisie(mode) {
+    etiqMode = mode;
+    $("etiqSaisie").hidden = false; $("etiqAide").hidden = false;
+    $("etiqChamp").value = "";
+    $("etiqChamp").placeholder = mode === "autre" ? "ex. VOITURE" : "ex. P-2026-118";
+    $("etiqAide").textContent = mode === "autre"
+      ? "Écrivez le nom de l'étiquette (VOITURE, ENTREPRISE…). N'écrivez jamais la vraie donnée : ce mot partira avec le document."
+      : `Nouveau nom pour ${etiqJeton(etiqCible)}, sur toutes les pages. N'écrivez jamais le vrai nom : ce code partira avec le document.`;
+    $("etiqChamp").focus();
+  }
+  $("etiqAutre").addEventListener("click", () => ouvrirSaisie("autre"));
+  $("etiqRenommer").addEventListener("click", () => ouvrirSaisie("renommer"));
+  function validerSaisie() {
+    if (!etiqCible) return;
+    if (etiqMode === "autre") {
+      const code = codeValide($("etiqChamp").value);
+      if (!code) { $("etiqAide").textContent = "Lettres sans accent, chiffres et _ . - / seulement (24 signes au plus)."; return; }
+      choisirType(code, code.toLowerCase());
+    } else if (etiqMode === "renommer") {
+      const err = renommerEtiquette(etiqJeton(etiqCible), $("etiqChamp").value);
+      if (err) { $("etiqAide").textContent = err; return; }
+      fermerEtiq();
+    }
+  }
+  $("etiqOk").addEventListener("click", validerSaisie);
+  $("etiqChamp").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); validerSaisie(); }
+    else if (e.key === "Escape") { e.preventDefault(); fermerEtiq(); }
+  });
+  $("etiqVisible").addEventListener("click", () => {
+    const c = etiqCible; if (!c) return;
+    fermerEtiq();
+    if (c.box) toggleBox(c.page, c.box);
+    else {
+      const i = c.page.strokes.indexOf(c.stroke);
+      if (i >= 0) { c.page.strokes.splice(i, 1); history.push({ type: "remove", page: c.page, item: c.stroke, index: i }); }
+      setStatus("Rendu visible.", true);
+    }
+    afterEdit();
+  });
+  $("etiqCancel").addEventListener("click", fermerEtiq);
+  $("etiqbar").addEventListener("pointerdown", (e) => e.stopPropagation());
+
+  /* Relier : c'est l'utilisateur qui regroupe des éléments sous une même lettre (jamais Kerckhoffs tout seul).
+   * Le premier élément touché prend une couleur ; chaque élément touché ensuite rejoint le groupe (ou le quitte). */
+  const COULEURS_GROUPES = ["#f5c400", "#2b8cff", "#24a148", "#e0457b", "#ff7a00", "#8a5cf6"];
+  const couleurGroupe = (gid) => COULEURS_GROUPES[(gid - 1) % COULEURS_GROUPES.length];
+  let relier = null; // { gid } pendant qu'on relie
+  const cibleOcc = (c) => (c.box ? c.box.occ : c.stroke && c.stroke.ref ? c.stroke.ref.occ : null);
+  function majGroupes() { attribuerJetons(); afterEdit(); }
+  function commencerRelier(c) {
+    const occ = cibleOcc(c); if (!occ) return;
+    S.groupes = S.groupes || new Map();
+    let gid = S.groupes.get(occ);
+    if (!gid) { S.prochainGroupe = (S.prochainGroupe || 0) + 1; gid = S.prochainGroupe; S.groupes.set(occ, gid); }
+    relier = { gid };
+    fermerEtiq();
+    $("modeTexte").textContent = "Relier : touchez les autres éléments"; $("modeChip").hidden = false;
+    majGroupes();
+    setStatus("Touchez chaque élément qui désigne la même chose : il prend la même couleur et la même lettre. Touchez-le encore pour le retirer. « Terminé » pour finir.", true);
+  }
+  function basculerRelier(c) {
+    const occ = cibleOcc(c); if (!occ || !relier) return;
+    if (S.groupes.get(occ) === relier.gid) S.groupes.delete(occ); else S.groupes.set(occ, relier.gid);
+    majGroupes();
+  }
+  function finirRelier() {
+    if (!relier) return;
+    relier = null;
+    $("modeTexte").textContent = MODES[tool] || ""; $("modeChip").hidden = !MODES[tool] || !page();
+    // Un groupe d'un seul élément ne relie rien : il disparaît.
+    const n = new Map(); S.groupes.forEach((g) => n.set(g, (n.get(g) || 0) + 1));
+    for (const [o, g] of [...S.groupes]) if (n.get(g) < 2) S.groupes.delete(o);
+    majGroupes();
+    setStatus(regroupementsFaits() ? "Regroupement fait. Le document dira que les regroupements sont faits par l'utilisateur." : "Aucun regroupement.", true);
+  }
+  $("etiqRelier").addEventListener("click", () => { if (etiqCible) commencerRelier(etiqCible); });
+  $("etiqDetacher").addEventListener("click", () => {
+    const c = etiqCible; if (!c) return;
+    const occ = cibleOcc(c); fermerEtiq();
+    if (occ && S.groupes) S.groupes.delete(occ);
+    const n = new Map(); S.groupes.forEach((g) => n.set(g, (n.get(g) || 0) + 1));
+    for (const [o, g] of [...S.groupes]) if (n.get(g) < 2) S.groupes.delete(o);
+    majGroupes(); setStatus("Détaché : il reprend sa propre lettre.", true);
+  });
+  // Les couleurs des groupes, sur l'écran seulement (jamais sur le document envoyé).
+  function dessinerGroupes() {
+    if (!S.groupes || !S.groupes.size) return;
+    ctx.save(); ctx.lineWidth = Math.max(4, cv.width / 300);
+    elementsEtiquetes().forEach((e) => {
+      if (e.page !== page()) return;
+      const g = S.groupes.get(e.occ); if (!g) return;
+      ctx.strokeStyle = couleurGroupe(g); ctx.globalAlpha = relier && relier.gid !== g ? 0.45 : 1;
+      e.rects.forEach((r) => { const m = ctx.lineWidth; ctx.strokeRect(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m); });
+    });
+    ctx.restore();
+  }
+  function trouverRef(p, x, y) {
+    const t = 8 / S.view.s;
+    return [...p.strokes].reverse().find((st) => st.ref && x >= st.x - t && x <= st.x + st.w + t && y >= st.y - t && y <= st.y + st.h + t) || null;
+  }
+
+  function toggleBox(p, b) {
+    b.active = !b.active; history.push({ type: "toggle", page: p, item: b });
+    setStatus(b.active ? "Masqué de nouveau." : `Rendu visible. Il avait été masqué par ${b.source || "la détection"}. Touchez-le encore pour le masquer.`, true);
+  }
+  function eraseAt(p, x, y) {
+    const i = hitItem(p, x, y);
+    if (i >= 0) { const [it] = p.strokes.splice(i, 1); history.push({ type: "remove", page: p, item: it, index: i }); return true; }
+    const b = hitBox(p, x, y);
+    if (b && b.active) { toggleBox(p, b); return true; }
+    return false;
+  }
+  function afterEdit() { changed(); render(); renderLegend(); updateUndo(); }
+
+  /* Le doigt : les mots qu'il recouvre disparaissent en entier, et prennent leur étiquette (NOM_1, REF_1…).
+   * Le type vient de ce que Kerckhoffs sait déjà de ces mots ; sinon, c'est une donnée (DONNEE_1). */
+  function etiqueterTrait(p, st) {
+    if (st.kind !== "line" || !p.lines) return;
+    const couvre = (x, y) => {
+      if (st.pts.length === 1) return Math.hypot(x - st.pts[0][0], y - st.pts[0][1]) <= st.w / 2;
+      for (let k = 1; k < st.pts.length; k++) if (distSeg(x, y, st.pts[k - 1], st.pts[k]) <= st.w / 2) return true;
+      return false;
+    };
+    const groupes = [];
+    p.lines.forEach((l) => {
+      const mots = l.words.filter((w) => {
+        const b = w.bbox; let n = 0;
+        for (const fx of [0.15, 0.5, 0.85]) for (const fy of [0.3, 0.7]) if (couvre(b.x0 + (b.x1 - b.x0) * fx, b.y0 + (b.y1 - b.y0) * fy)) n++;
+        return n >= 2;
+      });
+      if (mots.length) groupes.push(mots);
+    });
+    if (!groupes.length) return;
+    const principal = groupes.reduce((m, g) => (g.length > m.length ? g : m), groupes[0]);
+    const texte = principal.map((w) => w.text).join(" ").replace(/^[\s,;:.]+|[\s,;:.]+$/g, "");
+    if (!texte) return;
+    let type = "DONNEE", key = "DONNEE|" + norm(texte), value = texte;
+    const box = p.boxes.find((b) => (b.words || []).some((w) => principal.includes(w)));
+    const connu = box && [...S.tokens.values()].find((x) => x.token === box.token);
+    if (box && connu) { type = connu.type; key = box.key; value = connu.value; }
+    else {
+      const u = userTerms().find((x) => !x.needle && K.motsACherche(x.value).some((c) => principal.some((w) => K.ressemble(w.text, c))));
+      if (u) { type = u.type; key = u.key; value = u.value; }
+      else if (K.formeIdentifiant(texte)) type = "REF", key = "REF|" + norm(texte);
+    }
+    const tous = groupes.flat();
+    // Le doigt efface sans nommer : pas d'étiquette, la marque « kerckhoffs.app » à la place (pour nommer : le rectangle).
+    st.etiq = { rects: rectsDe(tous), zone: unionDe(rectsDe(principal)), key, type, value, marque: true };
+    // Le trait couvre-t-il surtout ces mots ? Alors il se range dessus (rien ne dépasse, aucun bout de lettre ne reste).
+    const zoneMots = unionDe(st.etiq.rects), marge = st.w;
+    const dehors = st.pts.filter(([x, y]) => x < zoneMots.x - marge || x > zoneMots.x + zoneMots.w + marge || y < zoneMots.y - marge || y > zoneMots.y + zoneMots.h + marge).length;
+    st.surMots = dehors <= st.pts.length * 0.2;
+  }
+
+  // Les peluches : quand on efface, l'encre des lettres tombe en petits grains, comme sous une gomme.
+  function peluches(p, st) {
+    if (!animOn || reduireMouvements()) return;
+    const fx = $("fx"), r = vp.getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
+    fx.width = Math.round(r.width * dpr); fx.height = Math.round(r.height * dpr);
+    const x = fx.getContext("2d"); x.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const z0 = cadreDe(st), zone = st.etiq ? unionDe(st.etiq.rects.concat([z0])) : z0;
+    const k = Math.min(1, 140 / Math.max(zone.w, zone.h, 1));
+    const W = Math.max(1, Math.round(zone.w * k)), H = Math.max(1, Math.round(zone.h * k));
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    const cx = c.getContext("2d", { willReadFrequently: true });
+    try { cx.drawImage(p.img, zone.x, zone.y, zone.w, zone.h, 0, 0, W, H); } catch (e) { return; }
+    const d = cx.getImageData(0, 0, W, H).data, grains = [];
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const o = (j * W + i) * 4;
+      if (d[o] * 0.299 + d[o + 1] * 0.587 + d[o + 2] * 0.114 < 150 && Math.random() < 0.7)
+        grains.push({ x: zone.x + (i + 0.5) / k, y: zone.y + (j + 0.5) / k, c: `rgb(${d[o]},${d[o + 1]},${d[o + 2]})`, vx: (Math.random() - 0.5) * 70, vy: -Math.random() * 70, t0: Math.random() * 0.12 });
+    }
+    st.pts.forEach((q, i) => { if (i % 2 === 0) grains.push({ x: q[0], y: q[1], c: "rgba(120,110,120,.95)", vx: (Math.random() - 0.5) * 120, vy: -40 - Math.random() * 60, t0: Math.random() * 0.1, miette: true }); });
+    if (!grains.length) return;
+    const s = S.view.s, tx = S.view.tx, ty = S.view.ty, taille = Math.max(1.5, (s / k) * 0.9), duree = 0.8;
+    let t0 = null;
+    const pas = (ts) => {
+      if (t0 === null) t0 = ts;
+      const t = (ts - t0) / 1000;
+      x.clearRect(0, 0, r.width, r.height);
+      if (t >= duree) return;
+      x.globalAlpha = Math.max(0, 1 - Math.max(0, t - 0.35) / (duree - 0.35));
+      for (const g of grains) {
+        const dt = Math.max(0, t - g.t0);
+        x.fillStyle = g.c;
+        const tl = g.miette ? Math.max(3, taille * 2.2) : taille;
+        x.fillRect(tx + g.x * s + g.vx * dt, ty + g.y * s + g.vy * dt + 0.5 * 1100 * dt * dt, tl, tl);
+      }
+      requestAnimationFrame(pas);
+    };
+    requestAnimationFrame(pas);
+  }
+  function updateUndo() { if (S.rbfUn) return; $("undo").disabled = !history.some((h) => S.pages.includes(h.page)); }
+
+  const vp = $("viewport");
+  vp.addEventListener("pointerdown", (e) => {
+    if (!page()) return;
+    vp.setPointerCapture(e.pointerId);
+    ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+    if (ptrs.size === 1) {
+      downAt = [e.clientX, e.clientY]; moved = false;
+      const pt = toImg(e.clientX, e.clientY);
+      const deplacer = tool === "move" || espace || (e.pointerType === "mouse" && (e.button === 1 || e.button === 2));
+      if (tool === "rect" && S.sel && S.sel.page === page() && !prise(S.sel.rect, pt[0], pt[1]) && !deplacer) {
+        // Un nouveau rectangle commence alors que le précédent attendait un choix : le précédent est masqué, pas perdu.
+        maskRect(S.sel.page, S.sel.rect); S.sel = null; $("selbar").hidden = true; $("selColonne").hidden = true; afterEdit();
+      }
+      if (deplacer) draft = { kind: "pan", pt, tx0: S.view.tx, ty0: S.view.ty, force: tool !== "move" };
+      else if (tool === "brush") draft = { kind: "line", w: brushW(), pts: [pt] };
+      else if (tool === "rect" || tool === "crop") {
+        const cible = tool === "rect" ? (S.sel && S.sel.page === page() ? S.sel : null) : (S.cadre && S.cadre.page === page() ? S.cadre : null);
+        const ou = cible ? prise(cible.rect, pt[0], pt[1]) : null;
+        if (ou) draft = { kind: "ajuster", cible, ou, pt0: pt, r0: { ...cible.rect } };
+        else draft = { kind: tool, x0: pt[0], y0: pt[1], x: pt[0], y: pt[1], w: 0, h: 0 };
+      }
+      else { draft = { kind: "erase" }; if (eraseAt(page(), pt[0], pt[1])) afterEdit(); }
+    } else if (ptrs.size === 2) {
+      if (draft && draft.kind !== "erase") render();
+      draft = null;
+      const [a, b] = [...ptrs.values()];
+      const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      pinch = { d0: Math.hypot(a[0] - b[0], a[1] - b[1]), s0: S.view.s, img: toImg(mid[0], mid[1]) };
+    }
+  });
+  vp.addEventListener("pointermove", (e) => {
+    if (!ptrs.has(e.pointerId)) return;
+    ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+    if (pinch && ptrs.size >= 2) {
+      const [a, b] = [...ptrs.values()];
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      const r = vp.getBoundingClientRect();
+      const mid = [(a[0] + b[0]) / 2 - r.left, (a[1] + b[1]) / 2 - r.top];
+      const s = Math.min(S.view.fit * 12, Math.max(S.view.fit * 0.8, pinch.s0 * d / pinch.d0));
+      S.view.s = s; S.view.tx = mid[0] - pinch.img[0] * s; S.view.ty = mid[1] - pinch.img[1] * s;
+      applyView(); showFit();
+      return;
+    }
+    if (!draft) return;
+    if (!moved && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 6) moved = true;
+    if (!moved) return;
+    const pt = toImg(e.clientX, e.clientY);
+    if (draft.kind === "pan") {
+      S.view.tx = draft.tx0 + (e.clientX - downAt[0]);
+      S.view.ty = draft.ty0 + (e.clientY - downAt[1]);
+      applyView(); showFit();
+    } else if (draft.kind === "line") {
+      const last = draft.pts[draft.pts.length - 1];
+      draft.pts.push(pt);
+      // Pendant le geste : un trait léger, qui laisse voir les mots touchés.
+      strokePath(ctx, { kind: "line", w: draft.w, pts: [last, pt] }, "rgba(0, 35, 102, 0.28)");
+    } else if (draft.kind === "ajuster") {
+      const { r0, ou } = draft, dx = pt[0] - draft.pt0[0], dy = pt[1] - draft.pt0[1], r = draft.cible.rect;
+      if (ou === "milieu") { r.x = r0.x + dx; r.y = r0.y + dy; }
+      else {
+        let x0 = r0.x, y0 = r0.y, x1 = r0.x + r0.w, y1 = r0.y + r0.h;
+        if (ou[1] === "g") x0 += dx; else x1 += dx;
+        if (ou[0] === "h") y0 += dy; else y1 += dy;
+        r.x = Math.min(x0, x1); r.y = Math.min(y0, y1); r.w = Math.max(4, Math.abs(x1 - x0)); r.h = Math.max(4, Math.abs(y1 - y0));
+      }
+      render();
+    } else if (draft.kind === "rect" || draft.kind === "crop") {
+      draft.x = Math.min(draft.x0, pt[0]); draft.y = Math.min(draft.y0, pt[1]);
+      draft.w = Math.abs(pt[0] - draft.x0); draft.h = Math.abs(pt[1] - draft.y0);
+      render();
+      if (draft.kind === "crop") dessinerCadre(draft);
+      else { ctx.save(); ctx.fillStyle = "rgba(0,0,0,.75)"; ctx.fillRect(draft.x, draft.y, draft.w, draft.h); ctx.restore(); }
+    } else if (eraseAt(page(), pt[0], pt[1])) afterEdit();
+  });
+  function endPointer(e) {
+    if (!ptrs.has(e.pointerId)) return;
+    ptrs.delete(e.pointerId);
+    if (pinch) { if (ptrs.size < 2) pinch = null; draft = null; return; }
+    if (!draft) return;
+    const p = page(), d = draft;
+    draft = null;
+    if (d.kind === "erase") return;
+    if (d.kind === "ajuster") { render(); return; } // la sélection reste, à sa nouvelle place
+    if (d.kind === "pan") {
+      if (!moved && !d.force) toucherEtiquette(p, d.pt[0], d.pt[1]);
+      return;
+    }
+    if (!moved || (d.kind === "rect" && (d.w < 4 || d.h < 4))) {
+      // Un simple toucher sur une zone détectée la masque ou la démasque.
+      const [x, y] = d.kind === "line" ? d.pts[0] : [d.x0, d.y0];
+      if (toucherEtiquette(p, x, y)) return;
+      if (d.kind === "rect") { render(); return; }
+    }
+    if (d.kind === "crop") {
+      if (d.w < 20 || d.h < 20) { render(); return; }
+      S.cadre = { page: p, rect: { x: d.x, y: d.y, w: d.w, h: d.h } };
+      $("cropbar").hidden = false; $("cropScreen").hidden = true; render();
+      return;
+    }
+    if (d.kind === "rect") { select(p, aimanter(p, { x: d.x, y: d.y, w: d.w, h: d.h })); return; }
+    const item = d;
+    etiqueterTrait(p, item);
+    p.strokes.push(item);
+    history.push({ type: "add", page: p, item });
+    afterEdit();
+    peluches(p, item);
+  }
+  vp.addEventListener("contextmenu", (e) => e.preventDefault()); // le bouton droit déplace la feuille
+  vp.addEventListener("pointerup", endPointer);
+  vp.addEventListener("pointercancel", endPointer);
+  vp.addEventListener("wheel", (e) => {
+    if (!page()) return;
+    e.preventDefault();
+    const r = vp.getBoundingClientRect();
+    const m = [e.clientX - r.left, e.clientY - r.top];
+    const img = toImg(e.clientX, e.clientY);
+    const s = Math.min(S.view.fit * 12, Math.max(S.view.fit * 0.8, S.view.s * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    S.view.s = s; S.view.tx = m[0] - img[0] * s; S.view.ty = m[1] - img[1] * s;
+    applyView(); showFit();
+  }, { passive: false });
+  $("fit").addEventListener("click", (e) => { e.stopPropagation(); fitView(); render(); });
+  $("fit").addEventListener("pointerdown", (e) => e.stopPropagation());
+  window.addEventListener("resize", () => { if (page()) { fitView(); render(); } });
+
+  // Retour : annule la dernière action (trait, rectangle, gomme, zone démasquée).
+  $("undo").addEventListener("click", () => {
+    if (S.rbfUn) { retourListe(); return; }
+    while (history.length) {
+      const h = history.pop();
+      if (!S.pages.includes(h.page)) continue;
+      if (h.type === "add") { const i = h.page.strokes.indexOf(h.item); if (i >= 0) h.page.strokes.splice(i, 1); }
+      else if (h.type === "remove") h.page.strokes.splice(Math.min(h.index, h.page.strokes.length), 0, h.item);
+      else if (h.type === "toggle") h.item.active = !h.item.active;
+      else if (h.type === "resize") Object.assign(h.item, h.avant, { moy: null });
+      else if (h.type === "crop") { Object.assign(h.page, h.avant); fitView(); detectPages([h.page]); }
+      const pi = S.pages.indexOf(h.page);
+      if (pi !== S.cur) { S.cur = pi; fitView(); updateUI(); }
+      break;
+    }
+    afterEdit();
+  });
+
+  /* ------------------------------------- recadrer : ne garder que la feuille */
+  function dessinerCadre(r) {
+    ctx.save();
+    ctx.fillStyle = "rgba(10,14,17,.6)";
+    ctx.beginPath(); ctx.rect(0, 0, cv.width, cv.height); ctx.rect(r.x, r.y, r.w, r.h); ctx.fill("evenodd");
+    ctx.setLineDash([14, 8]); ctx.lineWidth = Math.max(3, cv.width / 400); ctx.strokeStyle = "#ffd34d";
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.restore();
+  }
+  function annulerCadre() { S.cadre = null; $("cropbar").hidden = true; $("cropScreen").hidden = tool !== "crop" || !page(); render(); }
+  // Ce qui est visible dans le cadre de l'écran, en coordonnées de l'image
+  function zoneVisible() {
+    const p = page(), r = $("viewport").getBoundingClientRect(), v = S.view;
+    const x0 = Math.max(0, -v.tx / v.s), y0 = Math.max(0, -v.ty / v.s);
+    const x1 = Math.min(p.img.width, (r.width - v.tx) / v.s), y1 = Math.min(p.img.height, (r.height - v.ty) / v.s);
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
+  $("cropScreen").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("cropScreen").addEventListener("click", () => {
+    if (!page()) return;
+    S.cadre = { page: page(), rect: zoneVisible() };
+    $("cropOk").click();
+  });
+  $("cropCancel").addEventListener("click", () => { annulerCadre(); finGeste(); });
+  $("cropbar").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("cropOk").addEventListener("click", () => {
+    if (!S.cadre) return;
+    const p = S.cadre.page, r = S.cadre.rect;
+    const x = Math.max(0, Math.round(r.x)), y = Math.max(0, Math.round(r.y));
+    const w = Math.min(p.img.width - x, Math.round(r.w)), h = Math.min(p.img.height - y, Math.round(r.h));
+    if (w < 20 || h < 20) { annulerCadre(); return; }
+    const avant = { img: p.img, strokes: p.strokes, lines: p.lines, boxes: p.boxes, off: p.off };
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    c.getContext("2d").drawImage(p.img, -x, -y);
+    // Les traits déjà faits suivent le recadrage ; la lecture du texte est refaite sur la nouvelle image.
+    p.strokes = p.strokes.map((st) => st.kind === "rect" ? { ...st, x: st.x - x, y: st.y - y } : { ...st, pts: st.pts.map(([px, py]) => [px - x, py - y]) });
+    p.img = c; p.lines = null; p.boxes = []; p.off = { x: p.off.x + x, y: p.off.y + y };
+    history.push({ type: "crop", page: p, avant });
+    S.cadre = null; $("cropbar").hidden = true;
+    fitView(); changed(); render();
+    finGeste();
+    detectPages([p]);
+  });
+
+  /* ------------------------------ sélection au rectangle : masquer, ou tous les pareils */
+  const MOIS = "janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre";
+  const DATE_RE = () => new RegExp(`(?:\\b\\d{1,2}[./-]\\d{1,2}[./-](?:\\d{4}|\\d{2})\\b|(?:\\b\\d{1,2}(?:er)?\\s+)?(?:${MOIS})\\s+\\d{4}\\b)`, "gi");
+
+  // Transforme une forme (« 9999-9999 ») en règle de détection. Seuls des caractères simples sont acceptés.
+  function formeVersRegle(forme) {
+    const corps = [...forme].map((ch) => (ch === "9" ? "\\d" : ch === " " ? "\\s?" : ch.replace(/[.*+?^${}()|[\]\\\/-]/g, "\\$&"))).join("");
+    const re = new RegExp((/^[A-Za-z0-9]/.test(forme) ? "\\b" : "") + corps + (/[A-Za-z0-9]$/.test(forme) ? "\\b" : ""), "gi");
+    return { id: "forme-" + forme, type: "MOTIF", re, forme };
+  }
+
+  // Le même numéro, quels que soient les espaces, points ou tirets : « 12345678 » trouve aussi « 12 345 678 ».
+  function numeroVersRegle(chiffres) {
+    const re = new RegExp("(?<![0-9])" + chiffres.split("").join("[\\s.\\-/]{0,2}") + "(?![0-9])", "g");
+    return { id: "numero-" + chiffres, type: "MOTIF", re, numero: chiffres };
+  }
+
+  function select(p, rect) {
+    S.sel = { page: p, rect };
+    $("selbar").hidden = false; $("refbar").hidden = true; $("selSaisie").hidden = true; $("selPlusBloc").hidden = true;
+    // Un rectangle haut et étroit, collé aux traits d'une colonne : on propose de masquer toute la colonne, sauf son en-tête.
+    $("selColonne").hidden = !(rect.aimante && rect.h > p.img.height * 0.12 && colonneEntiere(p, rect));
+    if (!$("selColonne").hidden) $("selPlusBloc").hidden = false; // une colonne de tableau : on la propose tout de suite
+    render();
+  }
+  function unselect() { S.sel = null; $("selbar").hidden = true; $("refbar").hidden = true; $("selColonne").hidden = true; render(); }
+
+  /* Le rectangle s'aimante aux traits d'un tableau : s'il commence à quelques pixels d'un trait de colonne ou de ligne,
+   * son bord vient se coller au trait. Ainsi, rien ne dépasse entre le rectangle et le bord de la case. */
+  function pixelsDe(p, x0, y0, x1, y1) {
+    const X0 = Math.max(0, Math.floor(x0)), Y0 = Math.max(0, Math.floor(y0));
+    const X1 = Math.min(p.img.width, Math.ceil(x1)), Y1 = Math.min(p.img.height, Math.ceil(y1));
+    const W = X1 - X0, H = Y1 - Y0;
+    if (W < 2 || H < 2 || !p.img.getContext) return null;
+    const d = p.img.getContext("2d", { willReadFrequently: true }).getImageData(X0, Y0, W, H).data;
+    const lum = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) lum[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) | 0;
+    return { X0, Y0, W, H, lum };
+  }
+  const SOMBRE = 175;
+  function aimanter(p, r) {
+    const tol = Math.max(6, Math.round(Math.min(p.img.width, p.img.height) * 0.012));
+    const px = pixelsDe(p, r.x - tol, r.y - tol, r.x + r.w + tol, r.y + r.h + tol);
+    if (!px) return r;
+    const { X0, Y0, W, H, lum } = px;
+    const yA = Math.max(0, Math.round(r.y - Y0)), yB = Math.min(H, Math.round(r.y + r.h - Y0));
+    const xA = Math.max(0, Math.round(r.x - X0)), xB = Math.min(W, Math.round(r.x + r.w - X0));
+    const colonne = (x) => { let n = 0; for (let y = yA; y < yB; y++) if (lum[y * W + x] < SOMBRE) n++; return n / Math.max(1, yB - yA); };
+    const ligne = (y) => { let n = 0; for (let x = xA; x < xB; x++) if (lum[y * W + x] < SOMBRE) n++; return n / Math.max(1, xB - xA); };
+    const proche = (v0, f, max) => {
+      for (let dv = 0; dv <= tol; dv++) for (const v of [v0 - dv, v0 + dv]) if (v >= 0 && v < max && f(v) > 0.6) return v;
+      return null;
+    };
+    const out = { x: r.x, y: r.y, w: r.w, h: r.h };
+    const g = (r.h > 12) ? proche(Math.round(r.x - X0), colonne, W) : null;
+    const dr = (r.h > 12) ? proche(Math.round(r.x + r.w - X0), colonne, W) : null;
+    const hh = (r.w > 12) ? proche(Math.round(r.y - Y0), ligne, H) : null;
+    const bb = (r.w > 12) ? proche(Math.round(r.y + r.h - Y0), ligne, H) : null;
+    if (g != null) { const nx = X0 + g; out.w += out.x - nx; out.x = nx; }
+    if (dr != null) out.w = X0 + dr + 1 - out.x;
+    if (hh != null) { const ny = Y0 + hh; out.h += out.y - ny; out.y = ny; }
+    if (bb != null) out.h = Y0 + bb + 1 - out.y;
+    out.aimante = g != null && dr != null;
+    return out;
+  }
+  // Toute la colonne, sauf l'en-tête : du premier trait sous l'en-tête jusqu'au dernier trait du tableau.
+  function colonneEntiere(p, r) {
+    const px = pixelsDe(p, r.x, 0, r.x + r.w, p.img.height);
+    if (!px) return null;
+    const { W, H, lum } = px;
+    // Hauteur du trait vertical de gauche, autour du rectangle
+    const xg = 0, sombreG = (y) => lum[y * W + xg] < SOMBRE || (W > 1 && lum[y * W + 1] < SOMBRE);
+    let haut = Math.round(r.y + r.h / 2), bas = haut;
+    let trou = 0;
+    while (haut > 0 && trou < 4) { haut--; trou = sombreG(haut) ? 0 : trou + 1; }
+    trou = 0;
+    while (bas < H - 1 && trou < 4) { bas++; trou = sombreG(bas) ? 0 : trou + 1; }
+    // Les traits horizontaux qui traversent la colonne
+    const traits = [];
+    for (let y = haut; y <= bas; y++) {
+      let n = 0; for (let x = 0; x < W; x++) if (lum[y * W + x] < SOMBRE) n++;
+      if (n / W > 0.7) { if (traits.length && y - traits[traits.length - 1].fin <= 2) traits[traits.length - 1].fin = y; else traits.push({ debut: y, fin: y }); }
+    }
+    if (traits.length < 3) return null;
+    const y0 = traits[1].fin + 1, y1 = traits[traits.length - 1].debut;
+    if (y1 - y0 < 20) return null;
+    return { x: r.x, y: y0, w: r.w, h: y1 - y0 };
+  }
+  $("selColonne").addEventListener("click", () => {
+    if (!S.sel) return;
+    const c = colonneEntiere(S.sel.page, S.sel.rect);
+    if (c) { S.sel.rect = c; $("selColonne").hidden = true; render(); setStatus("Toute la colonne est sélectionnée, sans l'en-tête. Choisissez maintenant : Masquer, ou Tous les pareils."); }
+  });
+
+  function maskRect(p, rect) {
+    const item = { kind: "rect", x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+    p.strokes.push(item);
+    history.push({ type: "add", page: p, item });
+  }
+
+  // Transforme le texte sélectionné en un motif : une date, une forme de numéro, ou le mot lui-même.
+  function motifDe(texte) {
+    const t = texte.trim();
+    const d = DATE_RE();
+    if (d.test(t)) return { kind: "regle", sg: "date", pl: "dates", fem: true, regles: [{ id: "sel-date", type: "DATE", re: DATE_RE() }] };
+    if (/\d/.test(t)) {
+      // Forme simple et lisible : chaque chiffre devient 9 (« 2026-4471 » donne « 9999-9999 »).
+      const forme = t.replace(/\d/g, "9").replace(/\s+/g, " ");
+      const regles = [];
+      if (FORME_OK.test(forme)) regles.push(formeVersRegle(forme));
+      const chiffres = t.replace(/\D/g, "");
+      if (chiffres.length >= 4 && chiffres.length <= 24) regles.push(numeroVersRegle(chiffres)); // le même numéro, écrit autrement
+      if (regles.length) return { kind: "regle", sg: "élément semblable", pl: "éléments semblables", fem: false, regles };
+    }
+    return { kind: "terme", sg: "occurrence", pl: "occurrences", fem: true, terme: t };
+  }
+
+  $("selMask").addEventListener("click", () => {
+    if (!S.sel) return;
+    maskRect(S.sel.page, S.sel.rect);
+    S.sel = null; $("selbar").hidden = true; $("selColonne").hidden = true;
+    afterEdit(); finGeste();
+  });
+  $("selCancel").addEventListener("click", () => { unselect(); finGeste(); });
+  // Référencer : dire ce que contient la zone. Elle prend une étiquette, et tous les pareils sont retrouvés avec la même.
+  $("selRef").addEventListener("click", () => { if (S.sel) { $("selbar").hidden = true; $("refbar").hidden = false; } });
+  $("refCancel").addEventListener("click", () => { $("refbar").hidden = true; if (S.sel) $("selbar").hidden = false; });
+  $("refbar").addEventListener("pointerdown", (e) => e.stopPropagation());
+  document.querySelectorAll("#refbar [data-ref], #selbar [data-ref]").forEach((b) => b.addEventListener("click", () => referencer(b.dataset.ref)));
+  // « Autre… » : vous écrivez vous-même le nom de l'étiquette (VOITURE, ENTREPRISE…).
+  $("selAutre").addEventListener("click", () => { $("selSaisie").hidden = false; $("selChamp").value = ""; $("selChamp").focus(); });
+  const validerAutre = () => {
+    const code = codeValide($("selChamp").value);
+    if (!code) { setStatus("Lettres sans accent, chiffres et _ . - / seulement (24 signes au plus).", true); return; }
+    $("selSaisie").hidden = true; referencer(code);
+  };
+  $("selOk").addEventListener("click", validerAutre);
+  $("selChamp").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); validerAutre(); } else if (e.key === "Escape") { e.preventDefault(); $("selSaisie").hidden = true; } });
+  $("selPlus").addEventListener("click", () => { $("selPlusBloc").hidden = !$("selPlusBloc").hidden; });
+  const motsDans = (p, r) => (p.lines || []).flatMap((l) => l.words).filter((w) => {
+    const cx = (w.bbox.x0 + w.bbox.x1) / 2, cy = (w.bbox.y0 + w.bbox.y1) / 2;
+    return cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h;
+  });
+  async function referencer(type) {
+    if (!S.sel || busy) return;
+    const { page: p, rect } = S.sel;
+    S.sel = null; $("selbar").hidden = true; $("refbar").hidden = true; $("selColonne").hidden = true; finGeste();
+    const item = { kind: "rect", x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+    p.strokes.push(item); history.push({ type: "add", page: p, item }); afterEdit();
+    try { setStatus("Lecture du texte…", true); await ocr(p); } catch (e) {}
+    const elements = p.lines ? elementsDeSelection(p, rect) : [];
+    const brut = motsDans(p, rect).map((w) => w.text).join(" ").trim();
+    const valeur = (elements[0] || brut || "zone").trim();
+    item.ref = { type, value: valeur, key: /\d/.test(valeur) ? type + "|" + valeur.replace(/[\s.]/g, "").toLowerCase() : type + "|" + norm(valeur) };
+    for (const el of elements) {
+      const m = motifDe(el);
+      if (m.kind === "regle") m.regles.filter((r) => !(r.forme && /^[9 ]+$/.test(r.forme) && r.forme.replace(/ /g, "").length < 8))
+        .forEach((r) => { r.type = type; r.id += "|" + type; if (!S.extra.some((x) => x.id === r.id)) S.extra.push(r); });
+      else { const key = type + "|" + norm(el); S.appris = S.appris || []; if (!S.appris.some((x) => x.key === key)) S.appris.push({ type, value: el, key, ref: true }); }
+    }
+    const avant = instantane();
+    S.tokens = new Map(); S.counters = {};
+    await detectPages(S.pages, () => "");
+    const items = nouveaux(avant, { page: p, rect });
+    const nom = { PERSONNE: "un nom", ADRESSE: "une adresse", REF: "une référence", NUMERO: "un numéro ou code", DONNEE: "une donnée" }[type] || `« ${type} »`;
+    setStatus(`Zone référencée comme ${nom}.` + (items.length ? ` ${items.length} autre${items.length > 1 ? "s" : ""} trouvée${items.length > 1 ? "s" : ""} et masquée${items.length > 1 ? "s" : ""}, chacune avec sa lettre : vérifiez avec ‹ ›. Pour leur donner la même lettre : « Tous les pareils », ou « Relier… ».` : " Rien de pareil ailleurs."), true);
+    montrerTrouves(items, true);
+  }
+  $("selZone").addEventListener("click", () => {
+    if (!S.sel) return;
+    const { page: p, rect: r } = S.sel, W = p.img.width, H = p.img.height;
+    maskRect(p, r); // ici : masqué tout de suite
+    S.zones.push({ x: r.x / W, y: r.y / H, w: r.w / W, h: r.h / H });
+    S.sel = null; $("selbar").hidden = true; $("selColonne").hidden = true; finGeste();
+    afterEdit(); majZones();
+    const autres = S.pages.filter((q) => q !== p);
+    if (autres.length) { S.tokens = new Map(); S.counters = {}; detectPages(S.pages); }
+    setStatus("Zone retenue pour ce document : Kerckhoffs regarde au même endroit sur les autres pages et les prochaines photos.");
+  });
+  function majZones() {
+    $("zonesInfo").textContent = S.zones.length
+      ? `${S.zones.length} zone${S.zones.length > 1 ? "s" : ""} répétée${S.zones.length > 1 ? "s" : ""} sur chaque page.` : "";
+    $("zonesClear").hidden = !S.zones.length;
+    $("zonesChip").hidden = !S.zones.length;
+    $("zonesChip").textContent = `↺ ${S.zones.length} zone${S.zones.length > 1 ? "s" : ""} répétée${S.zones.length > 1 ? "s" : ""} · Effacer`;
+  }
+  $("zonesChip").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("zonesChip").addEventListener("click", () => $("zonesClear").click());
+  $("zonesClear").addEventListener("click", () => {
+    S.zones = []; majZones();
+    if (S.pages.length) { S.tokens = new Map(); S.counters = {}; detectPages(S.pages); }
+  });
+  $("selbar").addEventListener("pointerdown", (e) => e.stopPropagation()); // les boutons ne dessinent pas
+  // Ce qui est actif maintenant, pour retrouver ensuite les éléments nouvellement masqués.
+  // On compare mot par mot : un mot déjà masqué avant n'est pas « nouveau », même si une autre règle l'a repris.
+  const cleMot = (pi, w) => pi + "|" + Math.round(w.bbox.x0) + "," + Math.round(w.bbox.y0) + "|" + w.text;
+  function instantane() { return new Set(S.pages.flatMap((p, pi) => p.boxes.filter((b) => b.active).flatMap((b) => (b.words || []).map((w) => cleMot(pi, w))))); }
+  function nouveaux(avant, sauf) {
+    const out = [];
+    S.pages.forEach((p, pi) => p.boxes.forEach((b) => {
+      if (!b.active || (b.words || []).every((w) => avant.has(cleMot(pi, w)))) return;
+      if (sauf && sauf.page === p) { const cx = b.x + b.w / 2, cy = b.y + b.h / 2, r = sauf.rect; if (cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h) return; }
+      out.push({ page: pi, rects: b.rects || [b] });
+    }));
+    return out;
+  }
+
+  // Découpe une zone sélectionnée en informations distinctes : une par ligne, coupée aux grands espaces,
+  // l'étiquette (« N° contribuable : ») écartée, et chaque numéro séparé des mots qui l'entourent.
+  // Garde-fou : un morceau trop court ou trop courant (« 002 », « de ») n'est jamais cherché seul.
+  function elementsDeSelection(p, rect) {
+    const parLigne = new Map();
+    p.lines.forEach((l, li) => l.words.forEach((w) => {
+      const cx = (w.bbox.x0 + w.bbox.x1) / 2, cy = (w.bbox.y0 + w.bbox.y1) / 2;
+      if (cx >= rect.x && cx <= rect.x + rect.w && cy >= rect.y && cy <= rect.y + rect.h) {
+        if (!parLigne.has(li)) parLigne.set(li, []);
+        parLigne.get(li).push(w);
+      }
+    }));
+    const elements = [];
+    const ajouter = (t) => {
+      t = t.replace(/^[\s,;:.\-–]+|[\s,;:–]+$/g, "");
+      if (!t) return;
+      if (/\d/.test(t)) {
+        if (t.replace(/\D/g, "").length < 4 && !K.formeIdentifiant(t)) return;
+      } else if (!K.motsACherche(t).length) return;
+      if (!elements.includes(t)) elements.push(t);
+    };
+    for (const mots of parLigne.values()) {
+      mots.sort((a, b) => a.bbox.x0 - b.bbox.x0);
+      const h = mots.map((w) => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b)[Math.floor(mots.length / 2)] || 10;
+      const groupes = [[mots[0]]];
+      for (let i = 1; i < mots.length; i++) {
+        if (mots[i].bbox.x0 - mots[i - 1].bbox.x1 > h * 1.6) groupes.push([]);
+        groupes[groupes.length - 1].push(mots[i]);
+      }
+      for (const g of groupes) {
+        const texte = g.map((w) => w.text).join(" ");
+        const valeurs = K.valeursApresEtiquettes(texte).map((v) => v.valeur);
+        for (let morceau of valeurs.length ? valeurs : [texte]) {
+          if (morceau.includes(":")) morceau = morceau.slice(morceau.lastIndexOf(":") + 1);
+          // S'il y a un numéro, on ne cherche que les numéros : les mots autour (« Dossier n° », « Code client »)
+          // sont des étiquettes, pas des données. Sans numéro, le groupe entier est cherché (un nom, une adresse).
+          const runs = [];
+          for (const t of morceau.split(/\s+/).filter(Boolean)) {
+            const num = /\d/.test(t), dern = runs[runs.length - 1];
+            if (dern && dern.num === num) dern.mots.push(t); else runs.push({ num, mots: [t] });
+          }
+          const nums = runs.filter((r) => r.num);
+          if (nums.length) nums.forEach((r) => ajouter(r.mots.join(" ")));
+          else ajouter(morceau);
+        }
+      }
+    }
+    return elements;
+  }
+
+  $("selAll").addEventListener("click", async () => {
+    if (!S.sel || busy) return;
+    const { page: p, rect } = S.sel;
+    S.sel = null; $("selbar").hidden = true; $("selColonne").hidden = true; finGeste();
+    // La zone encadrée est toujours masquée, quoi que la lecture trouve ensuite.
+    maskRect(p, rect); afterEdit();
+    try {
+      setStatus("Lecture du texte…", true);
+      await ocr(p);
+    } catch (e) { setStatus("La lecture du texte a échoué : la zone a été masquée seule."); return; }
+    const elements = elementsDeSelection(p, rect);
+    if (!elements.length) { setStatus("Aucune information à chercher dans cette zone : elle a été masquée seule."); return; }
+    // Plusieurs éléments : on montre ce qui sera cherché, pour décocher les mots ordinaires (un titre, un en-tête de colonne).
+    if (elements.length >= 2 || elements.some((e) => K.queDesMotsCourants(e))) { setStatus(""); choisirElements(p, rect, elements); return; }
+    chercherPareils(p, rect, elements);
+  });
+  function choisirElements(p, rect, elements) {
+    const box = $("chercheListe"); box.textContent = "";
+    elements.forEach((el, i) => {
+      const l = document.createElement("label"), c = document.createElement("input");
+      c.type = "checkbox"; c.checked = !K.queDesMotsCourants(el); c.id = "cherche-" + i; c.value = el; // un mot ordinaire est proposé décoché
+      l.append(c, document.createTextNode(el)); box.append(l);
+    });
+    $("cherchePanel").hidden = false;
+    $("chercheOk").onclick = () => {
+      const choisis = [...box.querySelectorAll("input:checked")].map((c) => c.value);
+      $("cherchePanel").hidden = true;
+      if (choisis.length) chercherPareils(p, rect, choisis); else setStatus("Rien à chercher : la zone a été masquée seule.");
+    };
+    $("chercheAnnuler").onclick = () => { $("cherchePanel").hidden = true; setStatus("La zone a été masquée seule."); };
+  }
+  $("cherchePanel").addEventListener("pointerdown", (e) => e.stopPropagation());
+  async function chercherPareils(p, rect, elements) {
+    const termes = [];
+    for (const el of elements) {
+      const m = motifDe(el);
+      // Garde-fou : une forme faite seulement de chiffres et trop courte (« 9999 ») attraperait toutes les années et tous les codes.
+      // Pour un numéro court, on cherche ce numéro exact, pas sa forme.
+      if (m.kind === "regle") m.regles.filter((r) => !(r.forme && /^[9 ]+$/.test(r.forme) && r.forme.replace(/ /g, "").length < 8))
+        .forEach((r) => { if (!S.extra.some((x) => x.id === r.id)) S.extra.push(r); });
+      else termes.push(m.terme);
+    }
+    if (termes.length) {
+      const champ = $("tOther"), deja = champ.value.split(",").map((x) => norm(x.trim()));
+      const ajout = termes.filter((t) => !deja.includes(norm(t)));
+      S.parSelection = S.parSelection || new Set(); termes.forEach((x) => S.parSelection.add(norm(x)));
+      if (ajout.length) champ.value = [champ.value.trim(), ...ajout].filter(Boolean).join(", ");
+    }
+    const avant = instantane();
+    S.tokens = new Map(); S.counters = {};
+    await detectPages(S.pages, () => "");
+    const items = nouveaux(avant, { page: p, rect });
+    const liste = elements.map((e) => "« " + e + " »").join(", ");
+    setStatus(items.length
+      ? `${items.length} élément${items.length > 1 ? "s" : ""} semblable${items.length > 1 ? "s" : ""} masqué${items.length > 1 ? "s" : ""} (cherché : ${liste}). Vérifiez-les avec les flèches ‹ ›.`
+      : `Rien de semblable ailleurs (cherché : ${liste}). La zone a été masquée.`, true);
+    montrerTrouves(items, true);
+  }
+
+  /* ------------------ éléments trouvés : vue d'ensemble, étincelles, et on va les voir un par un */
+  let scintille = 0;
+  function montrerTrouves(items, vueEntiere) {
+    if (!items.length) { fermerTrouves(); return; }
+    S.trouves = { items, i: -1, t0: performance.now() };
+    if (vueEntiere) {
+      const p0 = items.find((it) => it.page === S.cur) ? S.cur : items[0].page;
+      if (p0 !== S.cur) { S.cur = p0; updateUI(); }
+      fitView();
+    }
+    majTrouves(); render();
+    cancelAnimationFrame(scintille);
+    let dernier = 0;
+    const boucle = (t) => {
+      if (!S.trouves || t - S.trouves.t0 > 6200) { render(); return; }
+      if (t - dernier > 50) { dernier = t; render(); }
+      scintille = requestAnimationFrame(boucle);
+    };
+    scintille = requestAnimationFrame(boucle);
+  }
+  function majTrouves() {
+    const T = S.trouves;
+    $("trouves").hidden = !T;
+    if (!T) return;
+    const n = T.items.length;
+    $("trouvesTexte").textContent = T.i < 0 ? `${n} trouvé${n > 1 ? "s" : ""} · ‹ › pour vérifier` : `${T.i + 1} / ${n}`;
+  }
+  function fermerTrouves() { S.trouves = null; cancelAnimationFrame(scintille); majTrouves(); render(); }
+  function zoomSur(r) {
+    fitView();
+    const vr = $("viewport").getBoundingClientRect();
+    const s = Math.min(S.view.fit * 6, Math.max(S.view.fit * 1.5, Math.min((vr.width * 0.6) / r.w, (vr.height * 0.35) / r.h)));
+    S.view.s = s; S.view.tx = vr.width / 2 - (r.x + r.w / 2) * s; S.view.ty = vr.height / 2 - (r.y + r.h / 2) * s;
+    applyView(); showFit();
+  }
+  function allerTrouve(d) {
+    const T = S.trouves; if (!T) return;
+    T.i = (T.i + d + T.items.length) % T.items.length;
+    const it = T.items[T.i];
+    if (it.page !== S.cur) { S.cur = it.page; updateUI(); }
+    const x0 = Math.min(...it.rects.map((r) => r.x)), y0 = Math.min(...it.rects.map((r) => r.y));
+    const x1 = Math.max(...it.rects.map((r) => r.x + r.w)), y1 = Math.max(...it.rects.map((r) => r.y + r.h));
+    zoomSur({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+    majTrouves(); render();
+  }
+  $("trouves").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("trouvesPrec").addEventListener("click", () => allerTrouve(-1));
+  $("trouvesSuiv").addEventListener("click", () => allerTrouve(1));
+  $("trouvesFermer").addEventListener("click", () => { fermerTrouves(); fitView(); render(); });
+
+  /* ------------- « Rechercher ici » : relire de près la zone affichée, sur la photo en pleine résolution */
+  // Les petits caractères (un numéro en bas de page) sont souvent trop petits pour le moteur de lecture.
+  // On découpe ce qui est à l'écran dans la photo d'origine, on l'agrandit, on le relit, et on cherche dedans.
+  async function chercherIci() {
+    const p = page(); if (!p || busy) return;
+    const z = zoneVisible(); if (z.w < 8 || z.h < 8) return;
+    busy = true; $("chercherIci").disabled = true; $("detect").disabled = true;
+    setStatus("Lecture de près de cette zone…", true);
+    let bm = null;
+    try {
+      if (!p.lines) { busy = false; await ocr(p); busy = true; }
+      let source = p.img, k = 1;
+      if (p.source && p.source.blob) {
+        try { bm = await createImageBitmap(p.source.blob, { imageOrientation: "from-image" }); source = bm; k = p.source.k; } catch (e) { bm = null; }
+      }
+      const sx = (z.x + p.off.x) * k, sy = (z.y + p.off.y) * k, sw = z.w * k, sh = z.h * k;
+      const f = Math.max(1, Math.min(3, 2000 / Math.max(sw, sh)));
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(sw * f)); c.height = Math.max(1, Math.round(sh * f));
+      const cx = c.getContext("2d");
+      cx.imageSmoothingQuality = "high"; cx.fillStyle = "#fff"; cx.fillRect(0, 0, c.width, c.height);
+      cx.drawImage(source, sx, sy, sw, sh, 0, 0, c.width, c.height);
+      if (bm && bm.close) { bm.close(); bm = null; }
+      const copie = pourLecture(c), echelle = copie.facteur * f * k;
+      const w = await getWorker();
+      const { data } = await w.recognize(copie);
+      const ramener = (b) => ({ x0: z.x + b.x0 / echelle, y0: z.y + b.y0 / echelle, x1: z.x + b.x1 / echelle, y1: z.y + b.y1 / echelle });
+      const lu = linesOf(data).map((l) => ({ words: (l.words || []).filter((x) => x.text && x.text.trim()).map((x) => ({ text: x.text, bbox: ramener(x.bbox), conf: x.confidence })) }))
+        .filter((l) => l.words.length);
+      // La lecture de près remplace l'ancienne lecture de cette zone.
+      const dedans = (wd) => { const mx = (wd.bbox.x0 + wd.bbox.x1) / 2, my = (wd.bbox.y0 + wd.bbox.y1) / 2; return mx >= z.x && mx <= z.x + z.w && my >= z.y && my <= z.y + z.h; };
+      p.lines = p.lines.map((l) => ({ words: l.words.filter((wd) => !dedans(wd)) })).filter((l) => l.words.length).concat(lu);
+      const avant = instantane();
+      detect(p); changed(); render();
+      const items = nouveaux(avant);
+      const nMots = lu.reduce((n, l) => n + l.words.length, 0);
+      setStatus(items.length
+        ? `Lecture de près : ${items.length} élément${items.length > 1 ? "s" : ""} de plus masqué${items.length > 1 ? "s" : ""} dans cette zone.`
+        : nMots ? `Lecture de près : ${nMots} mot${nMots > 1 ? "s" : ""} lu${nMots > 1 ? "s" : ""}, rien de plus à masquer ici.` : "Lecture de près : aucun texte lisible ici. Si quelque chose doit disparaître, effacez-le au doigt.", true);
+      montrerTrouves(items, false);
+    } catch (e) {
+      setStatus("La lecture de près a échoué. Effacez au doigt, ou réessayez.");
+    } finally {
+      if (bm && bm.close) bm.close();
+      busy = false; $("chercherIci").disabled = false; $("detect").disabled = !S.pages.length;
+      updateUI(); renderLegend();
+    }
+  }
+  $("chercherIci").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("chercherIci").addEventListener("click", chercherIci);
+
+  /* --------------------------------------------- lecture (OCR) et détection */
+  let workerP = null;
+  function getWorker() {
+    if (!workerP) {
+      workerP = Tesseract.createWorker("fra", 1, {
+        workerPath: FIGE ? FIGE.ocrWorker : abs("vendor/tesseract/worker.min.js"),
+        corePath: FIGE ? "fige/core" : abs("vendor/tesseract/core"),
+        langPath: FIGE ? "fige/lang" : abs("vendor/tesseract/lang"),
+        workerBlobURL: false,
+        cacheMethod: "none",
+        logger: (m) => {
+          if (m.status === "recognizing text") setStatus(`Lecture du texte… ${Math.round(m.progress * 100)} %`, true);
+          else if (m.status && m.progress < 1) setStatus("Préparation du moteur de lecture…", true);
+        },
+      }).then(async (w) => {
+        // Mode « texte épars » : lit chaque bloc séparément, mieux adapté aux formulaires et aux colonnes.
+        try { await w.setParameters({ tessedit_pageseg_mode: "11", preserve_interword_spaces: "1" }); } catch (e) {}
+        return w;
+      }).catch((e) => { workerP = null; throw e; });
+    }
+    return workerP;
+  }
+
+  function linesOf(data) {
+    if (data.lines && data.lines.length) return data.lines;
+    const out = [];
+    (data.blocks || []).forEach((bl) => (bl.paragraphs || []).forEach((pa) => (pa.lines || []).forEach((l) => out.push(l))));
+    return out;
+  }
+
+  // Copie nettoyée pour la lecture : niveaux de gris et contraste renforcé, même taille que l'image.
+  // Une photo prise sur une table se lit ainsi beaucoup mieux.
+  // La copie est agrandie jusqu'à ~2500 pixels de large (l'équivalent d'un scan à 300 dpi), où la lecture est la plus fiable.
+  function pourLecture(src) {
+    const k = Math.max(1, Math.min(2, 2500 / Math.max(src.width, 1)));
+    const c = document.createElement("canvas");
+    c.width = Math.round(src.width * k); c.height = Math.round(src.height * k);
+    const x = c.getContext("2d");
+    x.imageSmoothingQuality = "high";
+    x.drawImage(src, 0, 0, c.width, c.height);
+    c.facteur = k;
+    const im = x.getImageData(0, 0, c.width, c.height), d = im.data;
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < d.length; i += 4) { const g = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0; d[i] = g; hist[g]++; }
+    const total = d.length / 4;
+    let lo = 0, hi = 255, acc = 0;
+    while (lo < 255 && (acc += hist[lo]) < total * 0.01) lo++;
+    acc = 0;
+    while (hi > 0 && (acc += hist[hi]) < total * 0.05) hi--;
+    // Renforcer le contraste seulement si l'image est terne (papier gris, encre pâle).
+    // Sur une page blanche avec peu de texte, les repères tombent sur le blanc : on ne touche à rien.
+    const span = hi - lo;
+    const etirer = span >= 60 && span < 230;
+    // Fond blanc (scan, PDF, capture d'écran) : le texte gris clair est assombri, pour être lu comme le reste.
+    let med = 0; acc = 0;
+    while (med < 255 && (acc += hist[med]) < total * 0.5) med++;
+    const blanc = med >= 228;
+    for (let i = 0; i < d.length; i += 4) {
+      let v = etirer ? Math.max(0, Math.min(255, ((d[i] - lo) * 255) / span)) : d[i];
+      if (blanc) v = v >= med - 8 ? 255 : 255 * Math.pow(v / med, 2.4);
+      d[i] = d[i + 1] = d[i + 2] = v;
+    }
+    effacerTraits(d, c.width, c.height);
+    x.putImageData(im, 0, 0);
+    return c;
+  }
+  // Les traits d'un tableau gênent beaucoup la lecture : sur la copie lue (jamais sur l'image affichée),
+  // toute ligne sombre plus longue qu'un mot est effacée. Les lettres, elles, ne font jamais de si longs traits.
+  function effacerTraits(d, W, H) {
+    const Lh = Math.max(60, Math.round(W * 0.05)), Lv = Math.max(60, Math.round(H * 0.035));
+    const sombre = (i) => d[i * 4] < 150;
+    const blanchir = [];
+    for (let y = 0; y < H; y++) {
+      let deb = -1;
+      for (let x = 0; x <= W; x++) {
+        const s = x < W && sombre(y * W + x);
+        if (s && deb < 0) deb = x;
+        if (!s && deb >= 0) { if (x - deb >= Lh) blanchir.push([deb, y, x - deb, 1]); deb = -1; }
+      }
+    }
+    for (let x = 0; x < W; x++) {
+      let deb = -1;
+      for (let y = 0; y <= H; y++) {
+        const s = y < H && sombre(y * W + x);
+        if (s && deb < 0) deb = y;
+        if (!s && deb >= 0) { if (y - deb >= Lv) blanchir.push([x, deb, 1, y - deb]); deb = -1; }
+      }
+    }
+    // Un peu de marge autour du trait : son bord gris est effacé aussi.
+    for (const [x0, y0, w, h] of blanchir) {
+      for (let y = Math.max(0, y0 - (h === 1 ? 1 : 0)); y < Math.min(H, y0 + h + (h === 1 ? 1 : 0)); y++)
+        for (let x = Math.max(0, x0 - (w === 1 ? 1 : 0)); x < Math.min(W, x0 + w + (w === 1 ? 1 : 0)); x++) { const i = (y * W + x) * 4; d[i] = d[i + 1] = d[i + 2] = 255; }
+    }
+  }
+
+  async function ocr(p) {
+    if (p.lines) return;
+    const w = await getWorker();
+    const copie = pourLecture(p.img), k = copie.facteur;
+    const { data } = await w.recognize(copie);
+    // Les positions lues sur la copie agrandie sont ramenées à l'échelle de l'image.
+    const ramener = (b) => ({ x0: b.x0 / k, y0: b.y0 / k, x1: b.x1 / k, y1: b.y1 / k });
+    p.lines = linesOf(data).map((l) => ({ words: (l.words || []).filter((x) => x.text && x.text.trim()).map((x) => ({ text: x.text, bbox: ramener(x.bbox), conf: x.confidence })) }));
+    p.genre = genreDe(p);
+    p.qualite = qualiteDe(p);
+    p.kOff = p.qualite === "illisible";
+    majStyleChip();
+  }
+  /* La qualité de lecture d'une page, d'après l'assurance du moteur de lecture sur chaque mot.
+   *  - « sans-texte » : une image sans écriture (une photo de lieu) ; rien à dire ;
+   *  - « moyenne »    : on lit, mais pas tout : un message, une seule fois ;
+   *  - « illisible »  : beaucoup de signes, presque rien de sûr (photo trop floue, écriture inconnue) : K:OFF.
+   * Les seuils sont à régler sur les spécimens. */
+  const QUALITE = { motsMin: 12, nette: 150, illisibleNette: 120, bonsMin: 8, illisibleBons: 0.25, illisibleMoy: 50, moyenneBons: 0.6, moyenneMoy: 70 };
+  // L'image elle-même : est-ce une feuille (un fond uni avec de l'encre) ? Et les bords des lettres sont-ils nets ?
+  // Netteté : la moyenne du 1 % des plus fortes variations entre pixels voisins, sur une copie de 800 pixels de large.
+  function mesureImage(img) {
+    const W = 800, H = Math.max(1, Math.round(img.height * W / img.width));
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    x.drawImage(img, 0, 0, W, H);
+    const d = x.getImageData(0, 0, W, H).data, g = new Float32Array(W * H), hist = new Uint32Array(8);
+    for (let i = 0; i < W * H; i++) { g[i] = d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114; hist[Math.min(7, g[i] >> 5)]++; }
+    const tri = Float32Array.from(g).sort(), fondNiveau = tri[Math.floor(tri.length / 2)];
+    let encre = 0; for (let i = 0; i < g.length; i++) if (g[i] < fondNiveau - 60) encre++;
+    const lap = new Uint16Array(256 * 8); let n = 0;
+    for (let y = 1; y < H - 1; y++) for (let xx = 1; xx < W - 1; xx++) {
+      const i = y * W + xx, v = Math.min(2047, Math.abs(4 * g[i] - g[i - 1] - g[i + 1] - g[i - W] - g[i + W]) | 0);
+      lap[v]++; n++;
+    }
+    let reste = Math.max(1, Math.floor(n / 100)), somme = 0, compte = 0;
+    for (let v = lap.length - 1; v >= 0 && reste > 0; v--) { const k = Math.min(lap[v], reste); somme += k * v; compte += k; reste -= k; }
+    return { feuille: Math.max(...hist) / (W * H) >= 0.5 && encre / (W * H) >= 0.005, nette: compte ? somme / compte : 0 };
+  }
+  function qualiteDe(p) {
+    if (p.texte) return "bonne";
+    const mots = (p.lines || []).flatMap((l) => l.words).filter((w) => w.conf != null && /[A-Za-zÀ-ÿ0-9]{2,}/.test(w.text));
+    const n = mots.length, nbBons = mots.filter((w) => w.conf >= 70).length;
+    const bons = n ? nbBons / n : 0, moy = n ? mots.reduce((a, w) => a + w.conf, 0) / n : 0;
+    let im = { feuille: false, nette: 999 };
+    try { im = mesureImage(p.img); } catch (e) {}
+    p.mesure = { mots: n, bons: Math.round(bons * 100), moyenne: Math.round(moy), nette: Math.round(im.nette), feuille: im.feuille };
+    // Une feuille dont on ne lit presque rien : floue, ou une écriture inconnue. Ou beaucoup de signes, presque aucun sûr.
+    if (im.feuille && ((nbBons < QUALITE.bonsMin && im.nette < QUALITE.illisibleNette) || (n >= 15 && bons < QUALITE.illisibleBons && moy < QUALITE.illisibleMoy))) return "illisible";
+    if (n < QUALITE.motsMin && !im.feuille) return "sans-texte";
+    if (n < QUALITE.motsMin) return im.nette < QUALITE.nette ? "moyenne" : "bonne";
+    if (im.nette < QUALITE.nette || bons < QUALITE.moyenneBons || moy < QUALITE.moyenneMoy) return "moyenne";
+    return "bonne";
+  }
+  const MESSAGE_MOYENNE = "Photo de qualité moyenne. Kerckhoffs est fiable, mais tout outil a ses limites : votre contrôle compte encore plus.";
+  const MESSAGE_KOFF = "K:OFF : Kerckhoffs n'arrive pas à lire ce document (photo trop floue, ou écriture qu'il ne connaît pas). La détection automatique est désactivée : effacez au doigt ce qui doit disparaître.";
+  /* Document ou photo ? Un document (lettre, formulaire, tableau, capture d'écran) a beaucoup de mots lisibles et un fond uni ;
+   * une photo (des personnes, un lieu) a peu de mots et des couleurs variées. Une lettre photographiée sur une table reste un document. */
+  function genreDe(p) {
+    const mots = (p.lines || []).reduce((n, l) => n + l.words.filter((w) => (w.conf == null || w.conf >= 60) && w.text.length >= 2).length, 0);
+    const c = document.createElement("canvas"); c.width = 64; c.height = 64;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    x.drawImage(p.img, 0, 0, 64, 64);
+    const d = x.getImageData(0, 0, 64, 64).data;
+    const seaux = new Map();
+    for (let i = 0; i < d.length; i += 4) { const k = (d[i] >> 5) * 64 + (d[i + 1] >> 5) * 8 + (d[i + 2] >> 5); seaux.set(k, (seaux.get(k) || 0) + 1); }
+    const fond = Math.max(...seaux.values()) / (64 * 64); // part de la couleur dominante
+    return (mots >= 60 || (mots >= 15 && fond >= 0.3)) ? "document" : "photo";
+  }
+  // Le petit mot qui dit le style choisi pour cette page ; un toucher le change.
+  function majStyleChip() {
+    const p = page(), chip = $("styleChip");
+    if (!chip) return;
+    chip.hidden = !p || !p.genre || styleMasque !== "auto";
+    if (chip.hidden) return;
+    const s = styleDe(p);
+    chip.textContent = (s === "flou" ? "Flou opaque" : s === "noir" ? "Noir" : "Couleur du papier") + (p.styleForce ? "" : p.genre === "photo" ? " · photo" : " · document") + " ▾";
+  }
+
+  const norm = (s) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+  const isWordChar = (c) => !!c && /[a-z0-9]/i.test(c);
+
+  function userTerms() {
+    const out = [];
+    const ORIGINES = { tNames: "vos noms (Ce qu'il faut masquer)", tAddr: "vos adresses (Ce qu'il faut masquer)", tOther: "vos termes (Ce qu'il faut masquer)" };
+    const add = (field, type, splitWords) => $(field).value.split(",").map((s) => s.trim()).filter((s) => s.length > 1).forEach((t) => {
+      const key = type + "|" + norm(t);
+      const origine = field === "tOther" && S.parSelection && S.parSelection.has(norm(t)) ? "Tous les pareils" : ORIGINES[field];
+      out.push({ type, value: t, key, origine });
+      if (splitWords) t.split(/\s+/).filter((w) => w.length >= 3).forEach((w) => out.push({ type, value: t, key, needle: w, origine }));
+    });
+    add("tNames", "PERSONNE", true); add("tAddr", "ADRESSE", false); add("tOther", "DONNEE", false);
+    // Dernier balayage, valeurs lues après une étiquette (« Nom : … ») et zones référencées : cherchées partout ailleurs.
+    (S.balayage || []).concat(S.appris || []).forEach((t) => {
+      t = { ...t, origine: t.ref ? "Référencer" : t.appris ? "un nom ou une adresse trouvé après une étiquette" : "le dernier balayage" };
+      out.push(t);
+      if (t.type === "PERSONNE") t.value.split(/\s+/).filter((w) => w.length >= 3 && !K.estCourant(w)).forEach((w) => out.push({ ...t, needle: w }));
+    });
+    return out.sort((a, b) => (b.needle || b.value).length - (a.needle || a.value).length);
+  }
+
+  // Des lettres, pas des numéros : A, B… Z, puis AA, AB… Le nom de famille garde un numéro (NOM_1),
+  // pour qu'on lise d'un coup d'œil [NOM_1] [PRENOM_A] et [NOM_1] [PRENOM_B] : deux personnes de la même famille.
+  const lettre = (n) => { let s = ""; while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26); } return s; };
+  function tokenFor(key, type, value) {
+    if (!S.tokens.has(key)) {
+      S.counters[type] = (S.counters[type] || 0) + 1;
+      // Une étiquette renommée par l'utilisateur garde son nouveau nom, même si la détection est refaite.
+      const propre = S.renomme && S.renomme.get(key);
+      const rang = type === "NOM" ? String(S.counters[type]) : lettre(S.counters[type]);
+      S.tokens.set(key, { token: propre ? `[${propre}]` : `[${typeAffiche(type)}_${rang}]`, type, value, key });
+    }
+    return S.tokens.get(key).token;
+  }
+
+  /* Aucun lien automatique. Chaque endroit masqué reçoit sa propre lettre, même si le texte est écrit pareil
+   * (« Dupont » le père et « Dupont » la fille ne sont pas la même personne). Deux endroits ne partagent une lettre que si
+   * l'utilisateur l'a décidé : « Tous les pareils » (correspondance exacte, jamais « presque pareil »), ou un regroupement
+   * fait à la main (Relier…). Kerckhoffs trouve et masque ; c'est l'utilisateur qui relie. */
+  const occBox = (b, pi) => (b.source === "Tous les pareils" ? b.key : "OCC|" + pi + "|" + b.ancre);
+  const occTrait = (st, pi) => "REF|" + pi + "|" + Math.round(st.x) + "," + Math.round(st.y);
+  function lienDe(occ) { const g = S.groupes && S.groupes.get(occ); return g ? "GRP|" + g : occ; }
+  // Tous les éléments qui portent une étiquette : les zones détectées, et les rectangles nommés (« C'est : un nom »).
+  function elementsEtiquetes() {
+    const out = [];
+    S.pages.forEach((p, pi) => {
+      p.boxes.forEach((b) => { if (b.active && !String(b.key).startsWith("ZONE|")) out.push({ page: p, pi, box: b, occ: occBox(b, pi), type: b.type, value: b.value, rects: b.rects || [b] }); });
+      p.strokes.forEach((st) => { if (st.ref) out.push({ page: p, pi, stroke: st, occ: occTrait(st, pi), type: st.ref.type, value: st.ref.value, rects: [st] }); });
+    });
+    return out;
+  }
+  // Les lettres suivent l'ordre de lecture, et ne comptent que ce qui est réellement masqué :
+  // d'abord tout ce qui porte une étiquette (zones actives, rectangles nommés), page par page, de haut en bas puis de gauche à droite ;
+  // ensuite seulement ce qui a été rendu visible (pour garder sa lettre s'il est masqué de nouveau).
+  function attribuerJetons() {
+    S.tokens = new Map(); S.counters = {};
+    S.sansEtiquette = S.sansEtiquette || new Set();
+    const masque = `[${tr("masque")}]`, aNommer = [], ensuite = [];
+    S.pages.forEach((p, pi) => {
+      const ici = [];
+      p.boxes.forEach((b) => {
+        b.occ = occBox(b, pi);
+        b.sansEtiquette = S.sansEtiquette.has(b.occ);
+        b.token = b.sansEtiquette ? masque : "";
+        if (b.sansEtiquette) return;
+        if (b.active && !String(b.key).startsWith("ZONE|")) ici.push({ y: b.y, x: b.x, box: b }); else ensuite.push(b);
+      });
+      p.strokes.forEach((st) => {
+        if (!st.ref) return;
+        st.ref.occ = occTrait(st, pi); st.ref.sansEtiquette = S.sansEtiquette.has(st.ref.occ);
+        if (!st.ref.sansEtiquette) ici.push({ y: st.y, x: st.x, st });
+      });
+      // Même ligne si le haut est à moins d'une demi-hauteur de ligne : alors de gauche à droite.
+      ici.sort((a, b) => (Math.abs(a.y - b.y) < 12 ? a.x - b.x : a.y - b.y));
+      aNommer.push(...ici);
+    });
+    aNommer.forEach((e) => { if (e.box) e.box.token = tokenFor(lienDe(e.box.occ), e.box.type || String(e.box.key).split("|")[0], e.box.value); else jetonTrait(e.st); });
+    ensuite.forEach((b) => { b.token = tokenFor(lienDe(b.occ), b.type || String(b.key).split("|")[0], b.value); });
+  }
+  // L'étiquette d'un rectangle nommé (« C'est : un nom ») : la sienne, ou celle de son groupe.
+  const jetonTrait = (st) => (st.ref.sansEtiquette ? `[${tr("masque")}]` : tokenFor(lienDe(st.ref.occ || st.ref.key), st.ref.type, st.ref.value));
+  // Y a-t-il une lettre partagée par plusieurs endroits ? Alors c'est l'utilisateur qui a relié (voir plus haut).
+  function regroupementsFaits() {
+    const n = new Map();
+    elementsEtiquetes().forEach((e) => { const t = e.box ? e.box.token : jetonTrait(e.stroke); if (!/^\[(MASQUÉ|MASKED)\]$/.test(t)) n.set(t, (n.get(t) || 0) + 1); });
+    return [...n.values()].some((v) => v > 1);
+  }
+
+  // Renommer une étiquette : NOM_1 devient le code choisi par l'utilisateur, sur toutes les pages d'un coup.
+  // Kerckhoffs ne garde rien : le renommage est oublié avec le document. La correspondance reste chez l'utilisateur.
+  function codeValide(brut) {
+    const code = String(brut || "").trim().toUpperCase().replace(/\s+/g, "_");
+    return /^[A-Z0-9][A-Z0-9_.\-\/]{0,23}$/.test(code) ? code : null;
+  }
+  function renommerEtiquette(ancien, brut) {
+    const code = codeValide(brut);
+    if (!code) return "Le code ne peut contenir que des lettres sans accent, des chiffres et _ . - / (24 signes au plus).";
+    const neuf = `[${code}]`;
+    if (neuf === ancien) return "";
+    if ([...S.tokens.values()].some((t) => t.token === neuf)) return "Ce code est déjà utilisé par une autre étiquette.";
+    const t = [...S.tokens.values()].find((x) => x.token === ancien);
+    if (!t) return "Étiquette introuvable.";
+    if (!S.renomme) S.renomme = new Map();
+    S.renomme.set(t.key, code);
+    t.token = neuf;
+    S.pages.forEach((p) => p.boxes.forEach((b) => { if (b.token === ancien) b.token = neuf; }));
+    changed(); render(); renderLegend();
+    setStatus(`${ancien} s'appelle maintenant ${neuf}, sur toutes les pages.`);
+    return "";
+  }
+
+  // Étiquettes au-dessus de la valeur (formulaires officiels) : une ligne faite seulement d'étiquettes,
+  // parfois empilée en plusieurs langues, puis la valeur sur la ligne juste dessous, dans la même colonne.
+  // Renvoie, pour chaque ligne qui porte une valeur, les morceaux à masquer : { debut, fin, type, valeur, etiquette }.
+  function valeursAuDessus(p) {
+    const L = (p.lines || []).map((l, i) => {
+      const ws = l.words.filter((w) => w.text && w.text.trim());
+      if (!ws.length) return null;
+      const x0 = Math.min(...ws.map((w) => w.bbox.x0)), x1 = Math.max(...ws.map((w) => w.bbox.x1));
+      const y0 = Math.min(...ws.map((w) => w.bbox.y0)), y1 = Math.max(...ws.map((w) => w.bbox.y1));
+      const texte = l.words.map((w) => w.text).join(" ");
+      const types = (K.ligneEtiquette && K.ligneEtiquette(texte)) || (K.debutEtiquette && K.debutEtiquette(texte));
+      return { i, x0, x1, y0, y1, h: Math.max(4, y1 - y0), texte, types: types || null };
+    }).filter(Boolean);
+    // Les lignes sous « a », dans la colonne qui commence en x0 (celle de la première étiquette de la pile).
+    const dessous = (a, x0 = a.x0) => L.filter((b) => b !== a && b.y0 >= a.y1 - a.h * 0.3 && b.x0 >= x0 - a.h * 1.2 && b.x0 <= x0 + a.h * 3)
+      .sort((u, v) => u.y0 - v.y0);
+    // Une valeur plausible : assez de lettres ou de chiffres, et aucun mot d'étiquette (sinon c'est la suite de l'étiquette).
+    const nbSignes = (t) => t.replace(/[^A-Za-zÀ-ÿ0-9]/g, "").length;
+    const bruitLu = (x) => !/\d/.test(x.texte) && (nbSignes(x.texte) <= 3 || K.ligneVide(x.texte));
+    const avecMotEtiquette = (x) => x.texte.split(/[\s|\/]+/).some((w) => w.length > 1 && K.estMotEtiquette(w));
+    // La suite d'une longue étiquette : une phrase (quatre mots ou plus, surtout en minuscules).
+    const phrase = (x) => { const m = x.texte.split(/\s+/).filter((w) => /[A-Za-zÀ-ÿ]/.test(w)); return m.length >= 4 && m.filter((w) => /^[a-zà-ÿ(]/.test(w)).length >= m.length / 2; };
+    const sortie = new Map(), prises = new Set();
+    const ajouter = (v, a) => {
+      const morceaux = [], types = a.types;
+      let pos = 0;
+      v.texte.split("|").forEach((m, k) => {
+        const brut = m.replace(/^\s+|\s+$/g, ""), debut = v.texte.indexOf(brut, pos);
+        pos = debut + brut.length;
+        if (brut && /[A-Za-zÀ-ÿ0-9]/.test(brut) && debut >= 0)
+          morceaux.push({ debut, fin: debut + brut.length, type: types[Math.min(k, types.length - 1)], valeur: brut, etiquette: a.texte.split("|")[0].trim(),
+            libelle: (a.texte.split("|")[Math.min(k, a.texte.split("|").length - 1)] || "").trim() });
+      });
+      if (morceaux.length) sortie.set(v.i, (sortie.get(v.i) || []).concat(morceaux));
+    };
+    // Le bloc adresse du destinataire : « Madame » (sans virgule, seul sur sa ligne), puis le nom, puis l'adresse.
+    const CIVILITE = /^(madame|monsieur|mademoiselle|madame et monsieur|monsieur et madame|messieurs|famille|herr|herrn|frau|familie|herr und frau|signora|signor|signore|egregio signor|gentile signora|mr\.?|mrs\.?|ms\.?)$/i;
+    for (const a of L) {
+      if (!CIVILITE.test(a.texte.trim()) || prises.has(a.i)) continue;
+      let bas = a, k = 0;
+      for (const b of L.filter((x) => x.y0 >= a.y1 - a.h * 0.3 && Math.abs(x.x0 - a.x0) <= a.h * 2).sort((u, v) => u.y0 - v.y0)) {
+        if (k >= 4 || b.y0 - bas.y1 > bas.h * 1.8) break;
+        if (bruitLu(b) || prises.has(b.i) || b.texte.length > 50) continue;
+        const type = k === 0 && !/\d/.test(b.texte) ? "PERSONNE" : "ADRESSE";
+        prises.add(b.i);
+        ajouter(b, { types: [type], texte: k === 0 ? "nom du destinataire" : "adresse du destinataire" });
+        bas = b; k++;
+      }
+      if (k) prises.add(a.i);
+    }
+    // Étiquette à gauche, valeur à droite sur la même ligne (tableaux, cases « père / mère ») : une ou plusieurs colonnes.
+    for (const a of L) {
+      if (!a.types) continue;
+      const droite = L.filter((b) => b !== a && b.x0 > a.x1 && b.x0 - a.x1 < a.h * 6 && Math.abs((b.y0 + b.y1) / 2 - (a.y0 + a.y1) / 2) < a.h * 0.6 && !prises.has(b.i))
+        .sort((u, v) => u.x0 - v.x0);
+      const valeurs = [];
+      for (const b of droite) { if (b.types || avecMotEtiquette(b)) break; if (!bruitLu(b)) valeurs.push(b); }
+      if (!valeurs.length) continue;
+      prises.add(a.i);
+      valeurs.forEach((v) => { prises.add(v.i); ajouter(v, a); });
+    }
+    // Une ligne « Étiquette : valeur » porte déjà sa valeur : elle ne commence pas une pile, et n'est pas la valeur d'une autre.
+    const dejaRemplie = (x) => /^[A-Za-zÀ-ÿ][^:\d|]{1,40}:\s*[A-Za-zÀ-ÿ0-9]/.test(x.texte); // pas « 01.01.2020 | 10:15 »
+    for (const a of L) {
+      if (!a.types || prises.has(a.i) || dejaRemplie(a)) continue;
+      // Remonter la pile : on part de la dernière étiquette de la pile (les traductions empilées dessous).
+      let bas = a, pile = [a];
+      const bruit = bruitLu; // taches, traits, filigrane mal lu, formats [JJ/MM/AAAA]
+      const contientEtiquette = (x) => x.texte.split("|").some((m) => K.ligneEtiquette && K.ligneEtiquette(m));
+      const suivantes = (x) => dessous(x, a.x0).filter((y) => !bruit(y));
+      for (;;) {
+        const suivante = suivantes(bas)[0];
+        if (!suivante || suivante.y0 - bas.y1 > bas.h * 1.6) break;
+        if (!suivante.types && !contientEtiquette(suivante) && !avecMotEtiquette(suivante) && !phrase(suivante)) break;
+        pile.push(suivante); bas = suivante;
+      }
+      pile.forEach((x) => prises.add(x.i));
+      const v = suivantes(bas)[0];
+      if (!v || v.types || prises.has(v.i) || dejaRemplie(v) || v.y0 - bas.y1 > bas.h * 3.2) continue;
+      if (!/[A-Za-zÀ-ÿ0-9]/.test(v.texte) || v.texte.length > 80) continue;
+      prises.add(v.i);
+      // « Name | Vornamen » au-dessus de « EXEMPLE | Jean » : chaque morceau garde son type.
+      ajouter(v, a);
+    }
+    return sortie;
+  }
+  // Les adresses imprimées des administrations fédérales (3003 Berne : numéro postal réservé à l'administration fédérale)
+  // sont publiques : signalées, pas masquées d'office. Un toucher les masque si besoin.
+  const ADRESSE_ADMIN = /\b3003\s+Bern(e|a)?\b/i;
+
+  /* Nom de famille et prénom séparés, seulement quand c'est sûr : le formulaire a une case « Nom » ET une case « Prénom ».
+   * Alors « Nom : Dupont » devient [NOM_1] et « Prénom : Marie » [PRENOM_A]. Partout ailleurs, le nom complet reste un seul bloc. */
+  const PRENOM_RE = /^(prenoms?|prenom\(s\)|vornamen?|given names?|first names?|forenames?|nome|nomi)$/;
+  const NOM_RE = /^(nom|nom de famille|nom d'usage|nachname|familienname|name|cognome|surname|last name|family name)$/;
+  const nettoyerLibelle = (t) => norm(String(t || "")).replace(/[:*.,;()\d]+/g, " ").replace(/\s+/g, " ").trim();
+  function champsSepares(p) {
+    let pre = false, nom = false;
+    for (const l of p.lines || []) {
+      const t = nettoyerLibelle(l.words.map((w) => w.text).join(" "));
+      if (/\b(prenoms?|vornamen?|given names?|first names?|forenames?|nome)\b/.test(t)) pre = true;
+      if (/\b(nom de famille|nachname|familienname|cognome|surname|last name|family name|name)\b|\bnom\b(?! et)/.test(t)) nom = true;
+    }
+    return pre && nom;
+  }
+  function typePersonne(type, libelle, separes) {
+    if (type !== "PERSONNE" || !separes) return type;
+    const n = nettoyerLibelle(libelle);
+    return PRENOM_RE.test(n) ? "PRENOM" : NOM_RE.test(n) ? "NOM" : type;
+  }
+
+  function detect(p) {
+    if (p.kOff) { p.boxes = []; attribuerJetons(); return; } // K:OFF : Kerckhoffs ne lit rien, il ne masque rien tout seul
+    const terms = userTerms();
+    const separes = champsSepares(p);
+    const previous = new Map(p.boxes.map((b) => [b.ancre || b.key + "@" + b.x + "," + b.y, b.active]));
+    p.boxes = [];
+    const auDessus = valeursAuDessus(p);
+    p.lines.forEach((line, numeroLigne) => { line.numero = numeroLigne; });
+    for (const line of p.lines) {
+      const words = line.words;
+      if (!words.length) continue;
+      let raw = "", nrm = "";
+      const rr = [], nr = [];
+      words.forEach((w, i) => {
+        if (i) { raw += " "; nrm += " "; }
+        rr.push([raw.length, raw.length + w.text.length]); raw += w.text;
+        const n = norm(w.text);
+        nr.push([nrm.length, nrm.length + n.length]); nrm += n;
+      });
+      const used = new Set(), debutLigne = p.boxes.length;
+      const take = (ranges, s, e, type, value, key, flag, source) => {
+        const idx = [];
+        ranges.forEach(([a, b], i) => { if (a < e && b > s) idx.push(i); });
+        if (!idx.length || idx.some((i) => used.has(i))) return;
+        idx.forEach((i) => used.add(i));
+        // Un rectangle par mot, collé au haut et au bas des lettres : il suit la ligne même si la photo est penchée.
+        const bb = idx.map((i) => words[i].bbox);
+        const hMax = Math.max(...bb.map((b) => b.y1 - b.y0));
+        const pad = Math.max(3, Math.round(hMax * 0.15));
+        const rects = bb.map((b) => ({ x: b.x0 - pad, y: b.y0 - pad, w: b.x1 - b.x0 + 2 * pad, h: b.y1 - b.y0 + 2 * pad }));
+        const x0 = Math.min(...rects.map((r) => r.x)), y0 = Math.min(...rects.map((r) => r.y));
+        const x1 = Math.max(...rects.map((r) => r.x + r.w)), y1 = Math.max(...rects.map((r) => r.y + r.h));
+        const box = { x: x0, y: y0, w: x1 - x0, h: y1 - y0, rects, key, type, value, token: "", words: idx.map((i) => words[i]), active: true, flag, source };
+        box.ancre = key + "@" + box.x + "," + box.y; // reste la même si le nom complet agrandit la zone
+        if (type === "ADRESSE" && ADRESSE_ADMIN.test(raw)) { box.active = false; box.flag = "à relire"; box.source = "adresse publique de l'administration fédérale (3003 Berne) : signalée, pas masquée"; }
+        const was = previous.get(box.ancre);
+        if (was === false) box.active = false;
+        p.boxes.push(box);
+      };
+      // Vos choix d'abord (« C'est : un nom… » sur une étiquette) : ils passent avant toute autre règle.
+      for (const t of S.choisis || []) {
+        const needle = norm(t.value);
+        let from = 0, k;
+        while (needle && (k = nrm.indexOf(needle, from)) > -1) {
+          from = k + 1;
+          if (isWordChar(nrm[k - 1]) || isWordChar(nrm[k + needle.length])) continue;
+          take(nr, k, k + needle.length, t.type, t.value, t.key, null, t.origine);
+        }
+      }
+      // Les valeurs écrites sous une étiquette (formulaires officiels).
+      for (const v of auDessus.get(line.numero) || []) {
+        const type = typePersonne(v.type, v.libelle, separes);
+        const cle = type + "|" + (/\d/.test(v.valeur) ? v.valeur.replace(/[\s.]/g, "").toLowerCase() : norm(v.valeur));
+        take(rr, v.debut, v.fin, type, v.valeur, cle, null, `l'étiquette au-dessus « ${v.libelle || v.etiquette} »`);
+      }
+      for (const r of rules().concat(S.extra)) {
+        r.re.lastIndex = 0;
+        let m;
+        while ((m = r.re.exec(raw))) {
+          const v = m[0].trim();
+          const bad = r.check && !r.check(v);
+          if (bad && r.silent) continue; // faux positif connu : on ignore
+          take(rr, m.index, m.index + m[0].length, r.type, v, r.type + "|" + v.replace(/[\s.]/g, "").toLowerCase(), bad ? "à relire" : null,
+            r.forme || r.numero || String(r.id).startsWith("sel-") ? "Tous les pareils" : String(r.id).startsWith("balayage") ? "le dernier balayage" : "la détection : " + (r.label || r.type.toLowerCase()));
+        }
+      }
+      // Zones répétées : si du texte se trouve au même endroit que sur une page précédente, il est masqué.
+      for (const z of S.zones) {
+        const W = p.img.width, H = p.img.height, mx = 0.02 * W, my = 0.02 * H;
+        words.forEach((w, i) => {
+          const cx = (w.bbox.x0 + w.bbox.x1) / 2, cy = (w.bbox.y0 + w.bbox.y1) / 2;
+          if (cx >= z.x * W - mx && cx <= (z.x + z.w) * W + mx && cy >= z.y * H - my && cy <= (z.y + z.h) * H + my)
+            take(rr, rr[i][0], rr[i][1], "ZONE", w.text, "ZONE|" + norm(w.text), null, "« Même endroit, chaque page »");
+        });
+      }
+      // Valeurs qui suivent une étiquette de formulaire (« Nom : », « Né le »…), voir rules/etiquettes.js
+      for (const v of K.valeursApresEtiquettes(raw)) {
+        const type = typePersonne(v.etiquette.type, v.mot || v.etiquette.mots[0], separes);
+        take(rr, v.debut, v.fin, type, v.valeur, type + "|" + norm(v.valeur), null, "ce qui suit l'étiquette « " + (v.mot || v.etiquette.mots[0]) + " »");
+      }
+      // Identifiants reconnus à leur forme, dans n'importe quel pays (rules/registre.js : K.formeIdentifiant).
+      // Forme très typique : masqué d'office. Forme douteuse : signalé avant l'envoi, dans Remove Before Flight.
+      for (const c of K.candidatsIdentifiant(raw)) {
+        if (c.niveau === 2) take(rr, c.debut, c.fin, "IDENT", c.valeur, "IDENT|" + c.valeur.replace(/[\s.\-\/_]/g, "").toLowerCase(), null, "sa forme d'identifiant");
+      }
+      for (const t of terms) {
+        const needle = norm(t.needle || t.value);
+        let from = 0, k;
+        while ((k = nrm.indexOf(needle, from)) > -1) {
+          from = k + 1;
+          if (isWordChar(nrm[k - 1]) || isWordChar(nrm[k + needle.length])) continue;
+          take(nr, k, k + needle.length, t.type, t.value, t.key, null, t.origine);
+        }
+      }
+      // Puis mot par mot, en tolérant les erreurs de lecture (rules/registre.js : K.ressemble).
+      // Ainsi « Dupont » est trouvé même lu « DUP0NT », et une adresse même coupée ou mal espacée.
+      for (const t of terms) {
+        if (t.needle) continue;
+        const cherches = K.motsACherche(t.value);
+        // Au-delà de quatre mots, c'est une liste (plusieurs personnes, plusieurs références) : un numéro par mot.
+        const liste = cherches.length > 4;
+        words.forEach((w, i) => {
+          if (used.has(i)) return;
+          const c = cherches.find((x) => K.ressemble(w.text, x));
+          if (c) take(rr, rr[i][0], rr[i][1], t.type, liste ? c : t.value, liste ? t.type + "|" + norm(c) : t.key, null, t.origine + " (« " + c + " »)");
+        });
+      }
+      // Le nom complet : autour d'un nom trouvé, les mots voisins qui ressemblent à un prénom ou à un nom
+      // (majuscule au début, pas un mot courant, pas un mot repère) rejoignent la même étiquette.
+      // « Owner HUGO [PERSONNE_1] DOMINGUEZ » devient « Owner [PERSONNE_1] ».
+      p.boxes.slice(debutLigne).filter((b) => String(b.key).startsWith("PERSONNE|")).forEach((b) => {
+        const idx = b.words.map((w) => words.indexOf(w)).filter((i) => i >= 0);
+        if (!idx.length) return;
+        let g = Math.min(...idx), d = Math.max(...idx), ajout = 0;
+        // Même écriture que le nom trouvé : « HUGO » à côté de « EXEMPLE », « Hugo » à côté de « Exemple ».
+        const enCapitales = (t) => { const m = String(t).replace(/[^A-Za-zÀ-ÖØ-öø-ÿ]/g, ""); return m.length > 1 && m === m.toUpperCase(); };
+        const capitales = b.words.every((w) => enCapitales(w.text));
+        const voisin = (i) => i >= 0 && i < words.length && !used.has(i) && ressembleNom(words[i].text) && enCapitales(words[i].text) === capitales;
+        while (ajout < 4 && voisin(g - 1)) { g--; ajout++; agrandir(b, words[g], used, g); }
+        while (ajout < 4 && voisin(d + 1)) { d++; ajout++; agrandir(b, words[d], used, d); }
+        if (ajout) {
+          b.source = (b.source || "la détection") + " + le nom complet autour";
+          const ordre = b.words.map((w, j) => [words.indexOf(w), w, b.rects[j]]).sort((x, y) => x[0] - y[0]);
+          b.words = ordre.map((o) => o[1]); b.rects = ordre.map((o) => o[2]);
+        }
+      });
+      // Deux zones côte à côte avec la même étiquette (« HUGO » choisi comme nom, à côté de [PERSONNE_1]) n'en font qu'une.
+      const premier = (b) => Math.min(...b.words.map((w) => words.indexOf(w)));
+      const dernier = (b) => Math.max(...b.words.map((w) => words.indexOf(w)));
+      const ligneBoxes = p.boxes.slice(debutLigne).filter((b) => b.words && b.words.length).sort((a, b) => premier(a) - premier(b));
+      for (let i = ligneBoxes.length - 1; i > 0; i--) {
+        const a = ligneBoxes[i - 1], b = ligneBoxes[i];
+        if (a.key !== b.key || premier(b) !== dernier(a) + 1) continue;
+        b.words.forEach((w, j) => { a.words.push(w); a.rects.push(b.rects[j] || b.rects[0]); });
+        const x0 = Math.min(a.x, b.x), y0 = Math.min(a.y, b.y);
+        a.w = Math.max(a.x + a.w, b.x + b.w) - x0; a.h = Math.max(a.y + a.h, b.y + b.h) - y0; a.x = x0; a.y = y0;
+        p.boxes.splice(p.boxes.indexOf(b), 1);
+      }
+    }
+    attribuerJetons();
+  }
+  // Un mot qui ressemble à un prénom ou à un nom : « HUGO », « Dominguez », « Muster-Meier ».
+  const MOTS_REPERES = new Set(["owner", "holder", "applicant", "titulaire", "demandeur", "demanderesse", "inhaber", "inhaberin",
+    "anmelder", "anmelderin", "name", "nom", "prenom", "vorname", "nachname", "surname", "patient", "patiente", "client", "cliente",
+    "monsieur", "madame", "mademoiselle", "herr", "frau", "mr", "mrs", "ms", "dr", "docteur", "maitre", "me", "prof",
+    "propietario", "propietaria", "titular", "solicitante", "proprietario", "titolare", "richiedente", "nome", "cognome", "nombre", "apellido",
+    "rue", "avenue", "chemin", "route", "place", "boulevard", "strasse", "via", "street", "road"]);
+  function ressembleNom(t) {
+    const m = String(t).replace(/[,;.]+$/, "");
+    if (!/^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+$/.test(m) || m.length < 2) return false;
+    if (MOTS_REPERES.has(norm(m))) return false;
+    return !K.estCourant(m);
+  }
+  function agrandir(b, w, used, i) {
+    used.add(i);
+    const hMax = w.bbox.y1 - w.bbox.y0, pad = Math.max(3, Math.round(hMax * 0.15));
+    const r = { x: w.bbox.x0 - pad, y: w.bbox.y0 - pad, w: w.bbox.x1 - w.bbox.x0 + 2 * pad, h: w.bbox.y1 - w.bbox.y0 + 2 * pad };
+    b.rects.push(r); b.words.push(w);
+    const x0 = Math.min(b.x, r.x), y0 = Math.min(b.y, r.y);
+    b.w = Math.max(b.x + b.w, r.x + r.w) - x0; b.h = Math.max(b.y + b.h, r.y + r.h) - y0; b.x = x0; b.y = y0;
+  }
+
+  async function detectPages(list, message) {
+    if (busy) return;
+    busy = true; $("detect").disabled = true;
+    setStatus("Lecture du texte… (jusqu'à une minute la première fois)", true);
+    try {
+      for (let i = 0; i < list.length; i++) {
+        if (!S.pages.includes(list[i])) continue;
+        if (list.length > 1) setStatus(`Lecture de la page ${S.pages.indexOf(list[i]) + 1}…`);
+        await ocr(list[i]);
+        detect(list[i]);
+      }
+      // Un nom trouvé après « Nom : » est ensuite cherché partout, sur toutes les pages, avec le même numéro.
+      if (apprendreEtiquettes()) S.pages.forEach((p) => { if (p.lines) detect(p); });
+      changed(); render();
+      const n = S.pages.reduce((s, p) => s + p.boxes.filter((b) => b.active).length, 0);
+      const flagged = S.pages.reduce((s, p) => s + p.boxes.filter((b) => b.flag).length, 0);
+      // Ce que vous avez écrit dans « Réglages » et qui n'a été retrouvé nulle part : on le dit, pour que vous l'encadriez vous-même.
+      const trouvees = new Set(S.pages.flatMap((p) => p.boxes.map((b) => b.key)));
+      const masques = S.pages.flatMap((p) => p.boxes.flatMap((b) => (b.words || []).map((w) => w.text)));
+      const estMasque = (t) => trouvees.has(t.key) || (K.motsACherche(t.value).length > 0 &&
+        K.motsACherche(t.value).every((c) => masques.some((m) => K.ressemble(m, c) || norm(m).includes(norm(c)))));
+      const absents = [...new Map(userTerms().filter((t) => !t.needle && !estMasque(t)).map((t) => [t.key, t.value])).values()];
+      const manque = absents.length
+        ? ` Pas retrouvé${absents.length > 1 ? "s" : ""} : « ${absents.slice(0, 4).join(" », « ")} »${absents.length > 4 ? "…" : ""}. ` +
+          "La photo est peut-être trop pâle à cet endroit : encadrez-le avec « Rectangle »."
+        : "";
+      let galerie = S.galerie ? PHRASE_GALERIE + " " : ""; S.galerie = false;
+      // La qualité : K:OFF si une page ne se lit pas du tout ; sinon, une seule fois, le message de qualité moyenne.
+      if (list.some((q) => q.kOff)) galerie = MESSAGE_KOFF + " " + galerie;
+      else if (!S.qualiteDite && list.some((q) => q.qualite === "moyenne")) { S.qualiteDite = true; galerie = MESSAGE_MOYENNE + " " + galerie; }
+      if (message) setStatus(galerie + message() + manque, !!(manque || galerie)); else setStatus(galerie + (n ? `${n} zone${n > 1 ? "s" : ""} masquée${n > 1 ? "s" : ""} automatiquement.${flagged ? ` ${flagged} à relire (encadrée en orange).` : ""} Relisez et complétez au doigt.`
+                  : list.some((q) => q.kOff) ? "" : "Rien trouvé automatiquement. Pour les noms, écrivez-les dans « Réglages », ou effacez-les au doigt.") + manque, !!(manque || galerie));
+    } catch (e) {
+      setStatus("La lecture du texte a échoué (" + ((e && (e.message || e)) + "").slice(0, 120) + "). Effacez au doigt, ou réessayez.");
+    } finally {
+      busy = false; $("detect").disabled = !S.pages.length;
+      updateUI();
+    }
+  }
+  $("detect").addEventListener("click", () => {
+    detectPages(S.pages.filter(Boolean));
+  });
+  ["tNames", "tAddr", "tOther"].forEach((id) => $(id).addEventListener("change", () => {
+    if (!S.pages.length) return;
+    S.tokens = new Map(); S.counters = {};
+    detectPages(S.pages); // relit si besoin, puis masque les nouveaux termes partout
+  }));
+
+  // Les valeurs qui suivent une étiquette de personne ou d'adresse deviennent des termes à chercher partout.
+  // La clé est la même que celle de la valeur trouvée après l'étiquette : le même numéro partout (PERSONNE_1…).
+  const TYPES_APPRIS = ["PERSONNE", "ADRESSE"];
+  function apprendreEtiquettes() {
+    S.appris = S.appris || [];
+    const vus = new Set(S.appris.map((t) => t.key));
+    let nouveau = false;
+    for (const p of S.pages) for (const [, morceaux] of valeursAuDessus(p)) for (const m of morceaux) {
+      if (!TYPES_APPRIS.includes(m.type) || /\d{3,}/.test(m.valeur) && m.type === "PERSONNE" || !K.motsACherche(m.valeur).length) continue;
+      if (m.valeur.split(/\s+/).some((w) => K.estMotEtiquette(w, true))) continue;
+      if (m.type === "PERSONNE" && !m.valeur.split(/\s+/).every((w) => /^[A-ZÀ-ÖØ-Ý]/.test(w))) continue;
+      if (m.type === "ADRESSE" && !/\d/.test(m.valeur)) continue; // une adresse a un numéro (rue ou code postal)
+      if (m.type === "ADRESSE" && ADRESSE_ADMIN.test(m.valeur)) continue;
+      const key = m.type + "|" + norm(m.valeur);
+      if (vus.has(key)) continue;
+      vus.add(key); S.appris.push({ type: m.type, value: m.valeur, key, appris: true }); nouveau = true;
+    }
+    for (const p of S.pages) for (const l of p.lines || []) {
+      const raw = l.words.map((w) => w.text).join(" ");
+      for (const v of K.valeursApresEtiquettes(raw)) {
+        const type = v.etiquette.type;
+        if (!TYPES_APPRIS.includes(type) || /\d{3,}/.test(v.valeur) && type === "PERSONNE") continue;
+        if (K.estMotEtiquette && v.valeur.split(/\s+/).some((w) => K.estMotEtiquette(w, true))) continue;
+        if (type === "PERSONNE" && !v.valeur.split(/\s+/).filter(Boolean).every((w) => /^[A-ZÀ-ÖØ-Ý(]/.test(w))) continue;
+        if (type === "ADRESSE" && !/\d/.test(v.valeur)) continue;
+        if (!K.motsACherche(v.valeur).length) continue;
+        const key = type + "|" + norm(v.valeur);
+        if (vus.has(key)) continue;
+        vus.add(key); S.appris.push({ type, value: v.valeur, key, appris: true }); nouveau = true;
+      }
+    }
+    return nouveau;
+  }
+
+  function renderLegend() {
+    const used = new Set();
+    S.pages.forEach((p) => { p.boxes.forEach((b) => { if (b.active) used.add(b.token); }); p.strokes.forEach((st) => { if (st.ref) used.add(jetonTrait(st)); }); });
+    const rows = [...S.tokens.values()].filter((t) => used.has(t.token));
+    const L = $("legend");
+    L.hidden = !rows.length || !$("optMask").checked;
+    L.textContent = "";
+    if (!rows.length) return;
+    const titre = document.createElement("p"); titre.className = "legend-titre";
+    titre.textContent = "Légende (affichée ici seulement, jamais exportée)";
+    L.append(titre);
+    rows.forEach((t) => {
+      const ligne = document.createElement("div"); ligne.className = "legend-ligne";
+      const txt = document.createElement("span"); txt.textContent = `${t.token} = ${t.value}`;
+      const bouton = document.createElement("button"); bouton.type = "button"; bouton.className = "btn small";
+      bouton.textContent = "Renommer";
+      bouton.addEventListener("click", () => {
+        ligne.textContent = "";
+        const champ = document.createElement("input"); champ.type = "text"; champ.maxLength = 24;
+        champ.placeholder = "votre code, ex. P-2026-118"; champ.autocapitalize = "characters"; champ.spellcheck = false;
+        champ.setAttribute("aria-label", `Nouveau nom pour ${t.token}`);
+        const ok = document.createElement("button"); ok.type = "button"; ok.className = "btn small primary"; ok.textContent = "OK";
+        const non = document.createElement("button"); non.type = "button"; non.className = "btn small"; non.textContent = "✕";
+        non.setAttribute("aria-label", "Annuler");
+        const aide = document.createElement("p"); aide.className = "hint";
+        aide.textContent = `Remplace ${t.token} sur toutes les pages. N'écrivez jamais le vrai nom : ce code partira avec le document.`;
+        const valider = () => { const err = renommerEtiquette(t.token, champ.value); if (err) aide.textContent = err; };
+        ok.addEventListener("click", valider);
+        non.addEventListener("click", renderLegend);
+        champ.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); valider(); } else if (e.key === "Escape") { e.preventDefault(); renderLegend(); } });
+        ligne.append(champ, ok, non, aide);
+        champ.focus();
+      });
+      ligne.append(txt, bouton);
+      L.append(ligne);
+    });
+  }
+  $("optMask").addEventListener("change", () => { changed(); renderLegend(); });
+
+  /* ------------------------------------------------------------- export */
+  // La mention en bas des documents envoyés. Sans le mode strict, elle est toujours là.
+  // Seul un document contrôlé en mode strict peut partir sans mention, si l'utilisateur le choisit.
+  // Au niveau Strict, la mention peut être retirée : chaque effacement porte déjà sa propre marque « kerckhoffs.app ».
+  const papierPresent = () => S.pages.some((p) => styleDe(p) === "papier");
+  const avecMention = () => !strict || $("optMention").checked;
+  // La mention dit qui a masqué : la personne, avec l'outil. Ce n'est pas une garantie de Kerckhoffs.
+  const texteMention = () => tr("mention") + " · " + (papierPresent() ? tr("papier") + " · " : "") +
+    (regroupementsFaits() ? tr("regroupe") + " · " : "") + (strict ? tr("verifie") : tr("nonVerifie"));
+  // La bande du bas : la mention, et sur une page K:OFF la ligne qui l'explique (elle, toujours présente).
+  function lignesBande(masked, p) {
+    if (!masked) return [];
+    const l = [];
+    if (avecMention()) l.push(texteMention());
+    if (p ? p.kOff : S.pages.some((q) => q.kOff)) l.push(tr("kOff"));
+    return l;
+  }
+  function avecBande(c, masked, p) {
+    const lignes = lignesBande(masked, p);
+    if (!lignes.length) return c;
+    const h = Math.max(22, Math.round(c.width * 0.028)), H = h * lignes.length;
+    const o = document.createElement("canvas");
+    o.width = c.width; o.height = c.height + H;
+    const x = o.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, o.width, o.height);
+    x.drawImage(c, 0, 0);
+    x.fillStyle = "#eef1f4"; x.fillRect(0, c.height, o.width, H);
+    x.textBaseline = "middle";
+    lignes.forEach((t, i) => {
+      let fs = Math.round(h * 0.5);
+      x.font = `${fs}px system-ui, sans-serif`;
+      const dispo = o.width - h * 1.2, w = x.measureText(t).width;
+      if (w > dispo) { fs = Math.max(8, Math.floor(fs * dispo / w)); x.font = `${fs}px system-ui, sans-serif`; } // la ligne tient toujours en entier
+      x.fillStyle = /^K:OFF/.test(t) ? "#3d4650" : "#5a6872";
+      x.fillText(t, Math.round(h * 0.6), c.height + h * i + h / 2);
+    });
+    return o;
+  }
+  // La consigne pour l'IA, en tête du texte envoyé.
+  // « L'image fait foi » : seulement quand le texte a été lu sur une image (pas pour un texte collé), et que l'image part aussi.
+  const consigne = () => tr("consigne") + (regroupementsFaits() ? " " + tr("consigneGroupes") : "") +
+    (S.pages.some((p) => !p.texte) ? " " + tr("texteLu") : "");
+  function finalCanvas(p, masked) {
+    const c = document.createElement("canvas");
+    c.width = p.img.width; c.height = p.img.height;
+    paint(c.getContext("2d"), p, masked, true);
+    return c;
+  }
+
+  // Image allégée : plus petite, en niveaux de gris, contraste renforcé.
+  function lighten(src) {
+    const k = Math.min(1, LIGHT_DIM / Math.max(src.width, src.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(src.width * k); c.height = Math.round(src.height * k);
+    const x = c.getContext("2d");
+    x.imageSmoothingQuality = "high";
+    x.drawImage(src, 0, 0, c.width, c.height);
+    const im = x.getImageData(0, 0, c.width, c.height), d = im.data;
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < d.length; i += 4) {
+      const g = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0;
+      d[i] = g; hist[g]++;
+    }
+    const total = d.length / 4;
+    let lo = 0, hi = 255, acc = 0;
+    while (lo < 255 && (acc += hist[lo]) < total * 0.02) lo++;
+    acc = 0;
+    while (hi > 0 && (acc += hist[hi]) < total * 0.02) hi--;
+    const span = Math.max(1, hi - lo);
+    for (let i = 0; i < d.length; i += 4) {
+      const v = Math.max(0, Math.min(255, ((d[i] - lo) * 255) / span));
+      d[i] = d[i + 1] = d[i + 2] = v;
+    }
+    x.putImageData(im, 0, 0);
+    return c;
+  }
+
+  const blobOf = (c, type, q) => new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("export"))), type, q));
+  // Le nom du fichier ne contient que la date et un numéro : ni l'heure, ni le fuseau horaire.
+  let numeroExport = 0;
+  function jour() { const d = new Date(), z = (n) => String(n).padStart(2, "0"); return `${d.getUTCFullYear()}${z(d.getUTCMonth() + 1)}${z(d.getUTCDate())}`; }
+  function stamp() { numeroExport++; return `${jour()}-${numeroExport}`; }
+
+  function strokeMask(p) {
+    const k = 0.25, c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(p.img.width * k)); c.height = Math.max(1, Math.round(p.img.height * k));
+    const x = c.getContext("2d");
+    x.scale(k, k);
+    p.strokes.forEach((st) => strokePath(x, st));
+    const data = x.getImageData(0, 0, c.width, c.height).data;
+    return (px, py) => {
+      const ix = Math.round(px * k), iy = Math.round(py * k);
+      if (ix < 0 || iy < 0 || ix >= c.width || iy >= c.height) return false;
+      return data[(iy * c.width + ix) * 4 + 3] > 0;
+    };
+  }
+
+  /* Le texte envoyé ne garde que ce qui a été lu avec assurance. Sur un fond gris ou une photo un peu floue, la lecture
+   * fabrique parfois des mots ou déforme un montant : une IA qui calculerait avec ce texte se tromperait sans le savoir.
+   * Un mot douteux devient [?] ; un débris (« Bi », « e)) ») disparaît. L'image, elle, reste exacte et fait foi. */
+  const SEUIL_LETTRES = 55, SEUIL_CHIFFRES = 70;
+  // Les colonnes de montants avec centimes (« 242.50 ») : un nombre sans séparateur aligné dessus (« 77045 ») a perdu son point.
+  const MONTANT = /^-?[\d'’]*\d[.,]\d{2}$/;
+  function colonnesMontants(p) {
+    return (p.lines || []).flatMap((l) => l.words).filter((w) => (w.conf == null || w.conf >= 70) && MONTANT.test(w.text)).map((w) => w.bbox.x1);
+  }
+  function motSur(w, montants, largeur) {
+    const t = w.text, signes = t.replace(/[^A-Za-zÀ-ÿ0-9]/g, ""), chiffres = /\d/.test(t);
+    if (/^[:;–-]$/.test(t)) return t; // la ponctuation qui sépare une étiquette de sa valeur
+    // Un débris : deux signes au plus, entourés de ponctuation (« ge)) », « == ») ; une virgule ou un point final ne compte pas.
+    if (signes.length <= 2 && /[^A-Za-zÀ-ÿ0-9]/.test(t.replace(/[.,:;]$/, ""))) return null;
+    if (!signes.length) return null;
+    if (/^\d{2,}$/.test(t) && montants.some((x1) => Math.abs(x1 - w.bbox.x1) < largeur * 0.03)) return "[?]";
+    if (w.conf == null || w.conf >= (chiffres ? SEUIL_CHIFFRES : SEUIL_LETTRES)) return t;
+    if (signes.length <= 2 && !chiffres) return null;
+    return "[?]";
+  }
+  async function buildText(masked) {
+    for (let i = 0; i < S.pages.length; i++) {
+      if (!S.pages[i].lines) { setStatus(`Lecture de la page ${i + 1}…`); await ocr(S.pages[i]); }
+    }
+    return S.pages.map((p, pi) => {
+      const hit = masked ? strokeMask(p) : () => false;
+      const out = S.pages.length > 1 ? [`--- ${tr("page")} ${pi + 1} ---`] : [];
+      if (p.kOff && masked) { out.push("[K:OFF]"); return out.join("\n"); } // illisible : rien de sûr à transmettre en texte
+      const dans = (r, x, y) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+      // Une zone masquée (rectangle ou zone détectée) ne donne son étiquette qu'une fois, même si elle couvre plusieurs lignes.
+      const deja = new Set(), montants = p.texte ? [] : colonnesMontants(p);
+      for (const line of p.lines) {
+        const parts = []; let chiffreDouteux = false;
+        const pousser = (s) => { if (parts[parts.length - 1] !== s) parts.push(s); };
+        for (const w of line.words) {
+          if (masked) {
+            const mx = (w.bbox.x0 + w.bbox.x1) / 2, my = (w.bbox.y0 + w.bbox.y1) / 2;
+            const st = p.strokes.find((s) => (s.kind === "rect" && dans(s, mx, my)) || (s.etiq && s.etiq.rects.some((r) => dans(r, mx, my))));
+            if (st) {
+              if (deja.has(st)) continue;
+              deja.add(st);
+              const e = st.ref || (st.etiq && !st.etiq.marque ? st.etiq : null);
+              pousser(st.ref ? jetonTrait(st) : e ? tokenFor(e.key, e.type, e.value) : `[${tr("masque")}]`); continue;
+            }
+          }
+          const b = masked && p.boxes.find((bx) => bx.active && bx.words.includes(w));
+          if (b) { if (!deja.has(b)) { pousser(b.token); deja.add(b); } continue; }
+          const cx = (w.bbox.x0 + w.bbox.x1) / 2, cy = (w.bbox.y0 + w.bbox.y1) / 2;
+          if (hit(cx, cy)) { pousser(`[${tr("masque")}]`); continue; }
+          const m = p.texte ? w.text : motSur(w, montants, p.img.width);
+          if (m === "[?]") { pousser("[?]"); if (/\d/.test(w.text)) chiffreDouteux = true; } else if (m) parts.push(m);
+        }
+        // Une ligne faite seulement de [?] n'apprend rien, sauf si c'était un nombre : l'IA sait alors qu'un montant est là, à lire sur l'image.
+        if (parts.length && (!parts.every((x) => x === "[?]") || chiffreDouteux)) out.push(parts.join(" "));
+      }
+      return out.join("\n");
+    }).join("\n\n");
+  }
+
+  async function buildOutput() {
+    const f = fmt(), masked = $("optMask").checked, base = "kerckhoffs-" + stamp();
+    if (f === "text" || f === "both") {
+      let text = await buildText(masked);
+      if (masked) text = consigne() + "\n\n" + text;
+      lignesBande(masked, null).forEach((l) => { text += "\n\n— " + l; });
+      const txt = new File([text], base + ".txt", { type: "text/plain" });
+      if (f === "text") return { text, files: [txt] };
+      const files = [];
+      for (let i = 0; i < S.pages.length; i++) {
+        const c = avecBande(finalCanvas(S.pages[i], masked), masked, S.pages[i]);
+        files.push(new File([await blobOf(c, "image/jpeg", 0.9)], `${base}${S.pages.length > 1 ? "-p" + (i + 1) : ""}.jpg`, { type: "image/jpeg" }));
+      }
+      files.push(txt);
+      return { text, files };
+    }
+    if (f === "pdf") {
+      const { jsPDF } = window.jspdf;
+      let doc = null;
+      for (const p of S.pages) {
+        const c = avecBande(finalCanvas(p, masked), masked, p);
+        const o = c.width > c.height ? "l" : "p";
+        if (!doc) doc = new jsPDF({ orientation: o, unit: "px", format: [c.width, c.height], hotfixes: ["px_scaling"], compress: true });
+        else doc.addPage([c.width, c.height], o);
+        doc.addImage(c.toDataURL("image/jpeg", 0.85), "JPEG", 0, 0, c.width, c.height);
+      }
+      doc.setProperties({ title: "Document", author: "", subject: "", keywords: "", creator: "" });
+      doc.setCreationDate(`D:${jour()}000000+00'00'`); // la date seule, en heure universelle : rien sur le lieu ni l'heure
+      return { files: [new File([doc.output("blob")], base + ".pdf", { type: "application/pdf" })] };
+    }
+    const files = [];
+    for (let i = 0; i < S.pages.length; i++) {
+      let c = finalCanvas(S.pages[i], masked);
+      if (f === "light") c = lighten(c);
+      c = avecBande(c, masked, S.pages[i]);
+      const b = await blobOf(c, "image/jpeg", f === "light" ? 0.72 : 0.9);
+      files.push(new File([b], `${base}${S.pages.length > 1 ? "-p" + (i + 1) : ""}.jpg`, { type: "image/jpeg" }));
+    }
+    return { files };
+  }
+
+  async function prepared() {
+    const key = S.version + "|" + fmt() + "|" + $("optMask").checked + "|" + strict + "|" + avecMention();
+    if (S.cache && S.cache.key === key) return S.cache.out;
+    setStatus("Préparation…");
+    const out = await buildOutput();
+    S.cache = { key, out };
+    return out;
+  }
+  const sizeOf = (out) => out.files.reduce((s, f) => s + f.size, 0);
+  const kb = (n) => (n > 1048576 ? (n / 1048576).toFixed(1) + " Mo" : Math.max(1, Math.round(n / 1024)) + " ko");
+
+  function save(out) {
+    out.files.forEach((f, i) => setTimeout(() => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(f); a.download = f.name;
+      document.body.append(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+    }, i * 400));
+    setStatus(`Enregistré (${kb(sizeOf(out))}). Pensez à supprimer le fichier quand vous n'en avez plus besoin.`);
+  }
+
+  async function doSave() {
+    try { save(await prepared()); } catch (e) { setStatus("L'export a échoué. Réessayez."); }
+  }
+  $("btnSave").addEventListener("click", () => { closeSheet(); avecCerbere(doSave); });
+  $("btnShare").addEventListener("click", () => closeSheet());
+
+  // Ce navigateur sait-il partager un fichier vers une autre application ? (Firefox sur Android, la plupart des ordinateurs : non)
+  function partageFichiers() {
+    try { return !!(navigator.share && navigator.canShare && navigator.canShare({ files: [new File(["x"], "x.jpg", { type: "image/jpeg" })] })); }
+    catch (e) { return false; }
+  }
+  async function doShare() {
+    let out;
+    try { out = await prepared(); } catch (e) { setStatus("L'export a échoué. Réessayez."); return; }
+    const data = fmt() === "text" ? { text: out.text } : { files: out.files };
+    if (!navigator.share || (data.files && navigator.canShare && !navigator.canShare(data))) {
+      save(out);
+      setStatus("Ce navigateur ne sait pas partager un fichier : il a été enregistré dans vos Téléchargements. Vous pouvez aussi le copier (menu, « Copier l'image »), puis le coller dans un message ou une IA.", true);
+      return;
+    }
+    try {
+      await navigator.share(data);
+      setStatus(`Partagé (${kb(sizeOf(out))}).`);
+    } catch (e) {
+      if (e.name === "AbortError") setStatus("");
+      else setStatus("C'est prêt. Touchez encore « Partager ».");
+    }
+  }
+  $("btnShare").addEventListener("click", () => avecCerbere(doShare));
+
+  async function doCopy() {
+    try {
+      if (fmt() === "text") {
+        const out = await prepared();
+        await navigator.clipboard.writeText(out.text);
+        setStatus("Texte copié. Collez-le dans l'IA.");
+        return;
+      }
+      // Une image : la page affichée. Le presse-papiers n'accepte que le PNG.
+      const p = page(), f = fmt(), masked = $("optMask").checked;
+      if (f === "both") {
+        // L'image et le texte dans la même copie : l'application où vous collez prend ce qu'elle sait lire.
+        const out = await prepared();
+        const img = await blobOf(avecBande(finalCanvas(p, masked), masked, p), "image/png");
+        try {
+          await navigator.clipboard.write([new ClipboardItem({ "image/png": img, "text/plain": new Blob([out.text], { type: "text/plain" }) })]);
+          setStatus("Image et texte copiés. Collez dans l'IA ; si elle ne prend que l'image, choisissez « Texte seul » dans Réglages et copiez encore.", true);
+        } catch (e2) {
+          await navigator.clipboard.write([new ClipboardItem({ "image/png": img })]);
+          setStatus("Image copiée (ce navigateur ne copie pas les deux ensemble). Pour le texte : « Texte seul » dans Réglages.", true);
+        }
+        return;
+      }
+      const make = async () => {
+        let c = finalCanvas(p, masked);
+        if (f === "light") c = lighten(c);
+        return blobOf(avecBande(c, masked, p), "image/png");
+      };
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": make() })]);
+      } catch (e1) {
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": await make() })]);
+      }
+      setStatus((f === "pdf" ? "Un PDF ne se copie pas : l'image de la page affichée a été copiée. " : "Image copiée. ") + "Collez-la dans l'IA.");
+    } catch (e) {
+      setStatus("La copie n'est pas autorisée ici. Utilisez « Partager » ou « Enregistrer ».");
+    }
+  }
+  $("btnCopy").addEventListener("click", () => { closeSheet(); avecCerbere(doCopy); });
+
+  /* ------------------ profil : les mots appris, gardés dans un QR code chiffré que VOUS conservez */
+  // Le profil ne contient que des listes de mots et des formes simples (ex. « 99-999 »), jamais de code ni de document.
+  const PROFIL_PREFIXE = "KERCKHOFFS:1:";
+  const LIMITES = { mots: 150, longueur: 80, formes: 30 };
+  let profilSnapshot = "";       // contenu du profil au dernier enregistrement ou ouverture
+  let profilEnAttente = null;    // texte du QR code lu, en attente de la phrase de passe
+  let profilLu = null;           // profil déchiffré, en attente de confirmation
+
+  const liste = (id) => $(id).value.split(",").map((s) => s.trim()).filter(Boolean);
+  // Format des QR codes de préférences. RÈGLE : une nouvelle version de Kerckhoffs doit toujours savoir lire
+  // les QR codes des versions précédentes. On n'enlève jamais un format : si FORMAT_PROFIL augmente,
+  // validerProfil continue d'accepter les anciens et complète ce qui leur manque.
+  const FORMAT_PROFIL = 1;
+  function profilActuel() {
+    return {
+      v: FORMAT_PROFIL,
+      noms: liste("tNames"), adresses: liste("tAddr"), autres: liste("tOther"),
+      formes: S.extra.filter((r) => r.forme).map((r) => r.forme),
+      numeros: S.extra.filter((r) => r.numero).map((r) => r.numero),
+      zones: [], // les zones répétées ne servent que pour le document en cours : elles ne sont jamais gardées
+      dates: S.extra.some((r) => r.id === "sel-date"),
+    };
+  }
+  const profilVide = (p) => !p.noms.length && !p.adresses.length && !p.autres.length && !p.formes.length && !p.numeros.length && !p.zones.length && !p.dates;
+  const profilModifie = () => { const p = profilActuel(); return !profilVide(p) && JSON.stringify(p) !== profilSnapshot; };
+
+  // Contrôle strict : tout ce qui ne correspond pas exactement au format attendu est refusé.
+  const FORME_OK = /^[A-Za-zÀ-ÿ0-9 .\-\/:'’]{2,40}$/;
+  function validerProfil(o) {
+    if (!o || typeof o !== "object" || Array.isArray(o) || !Number.isInteger(o.v) || o.v < 1 || o.v > FORMAT_PROFIL) return null;
+    const cles = ["v", "noms", "adresses", "autres", "formes", "numeros", "zones", "dates"];
+    o.numeros = o.numeros || []; o.zones = o.zones || []; // profils plus anciens
+    if (Object.keys(o).some((k) => !cles.includes(k))) return null;
+    const mots = (a) => Array.isArray(a) && a.length <= LIMITES.mots &&
+      a.every((s) => typeof s === "string" && s.length >= 1 && s.length <= LIMITES.longueur && !/[\u0000-\u001f<>]/.test(s));
+    if (!mots(o.noms) || !mots(o.adresses) || !mots(o.autres)) return null;
+    if (!Array.isArray(o.formes) || o.formes.length > LIMITES.formes || !o.formes.every((f) => typeof f === "string" && FORME_OK.test(f))) return null;
+    if (!Array.isArray(o.numeros) || o.numeros.length > LIMITES.formes || !o.numeros.every((n) => typeof n === "string" && /^\d{4,24}$/.test(n))) return null;
+    if (!Array.isArray(o.zones) || o.zones.length > 20 || !o.zones.every((z) => Array.isArray(z) && z.length === 4 && z.every((v) => typeof v === "number" && v >= 0 && v <= 1))) return null;
+    if (typeof o.dates !== "boolean") return null;
+    return o;
+  }
+
+  function appliquerProfil(o) {
+    const fusion = (id, a) => { const v = liste(id); a.forEach((x) => { if (!v.includes(x)) v.push(x); }); $(id).value = v.join(", "); };
+    fusion("tNames", o.noms); fusion("tAddr", o.adresses); fusion("tOther", o.autres);
+    o.formes.forEach((f) => { if (!S.extra.some((r) => r.forme === f)) S.extra.push(formeVersRegle(f)); });
+    if (o.dates && !S.extra.some((r) => r.id === "sel-date")) S.extra.push({ id: "sel-date", type: "DATE", re: DATE_RE() });
+    o.numeros.forEach((n) => { if (!S.extra.some((r) => r.numero === n)) S.extra.push(numeroVersRegle(n)); });
+    // Les zones d'anciens profils sont ignorées : une zone ne vaut que pour le document où elle a été tracée.
+    profilSnapshot = JSON.stringify(profilActuel());
+    if (S.pages.length) { S.tokens = new Map(); S.counters = {}; detectPages(S.pages); }
+    majProfilStatut();
+  }
+
+  // Chiffrement : PBKDF2 (310 000 tours) + AES-GCM 256. Toute modification du QR code est détectée et refusée.
+  const b64u = (u8) => btoa(String.fromCharCode(...u8)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  async function cle(pass, sel) {
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey({ name: "PBKDF2", salt: sel, iterations: 310000, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+  async function chiffrerProfil(o, pass) {
+    const sel = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await cle(pass, sel), new TextEncoder().encode(JSON.stringify(o))));
+    const tout = new Uint8Array(sel.length + iv.length + ct.length);
+    tout.set(sel); tout.set(iv, 16); tout.set(ct, 28);
+    return PROFIL_PREFIXE + b64u(tout);
+  }
+  async function dechiffrerProfil(texte, pass) {
+    const d = unb64u(texte.slice(PROFIL_PREFIXE.length));
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: d.slice(16, 28) }, await cle(pass, d.slice(0, 16)), d.slice(28));
+    return validerProfil(JSON.parse(new TextDecoder().decode(pt)));
+  }
+  async function empreinte(o) {
+    const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(o))));
+    const x = [...h.slice(0, 3)].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+    return x.slice(0, 2) + "-" + x.slice(2);
+  }
+  const resume = (o) => {
+    const n = o.noms.length + o.adresses.length + o.autres.length;
+    const parts = [`${n} mot${n > 1 ? "s" : ""} ou nom${n > 1 ? "s" : ""}`];
+    if (o.formes.length) parts.push(`${o.formes.length} forme${o.formes.length > 1 ? "s" : ""} de numéro`);
+    if (o.numeros.length) parts.push(`${o.numeros.length} numéro${o.numeros.length > 1 ? "s" : ""}`);
+    if (o.dates) parts.push("toutes les dates");
+    return parts.join(", ");
+  };
+
+  // Dessin du QR code, avec une légende sans aucune donnée personnelle.
+  function dessinerQR(texte, legende) {
+    let qr = null;
+    for (const niveau of ["M", "L"]) {
+      try { qr = qrcode(0, niveau); qr.addData(texte, "Byte"); qr.make(); break; } catch (e) { qr = null; }
+    }
+    if (!qr) return null;
+    const n = qr.getModuleCount(), cell = Math.max(4, Math.floor(720 / (n + 8))), marge = cell * 4, bas = 70;
+    const c = document.createElement("canvas");
+    c.width = n * cell + marge * 2; c.height = n * cell + marge * 2 + bas;
+    const x = c.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+    x.fillStyle = "#000";
+    for (let r = 0; r < n; r++) for (let k = 0; k < n; k++) if (qr.isDark(r, k)) x.fillRect(marge + k * cell, marge + r * cell, cell, cell);
+    x.fillStyle = "#002366"; x.font = "600 24px system-ui, sans-serif"; x.textAlign = "center";
+    x.fillText(legende, c.width / 2, c.height - bas / 2);
+    return c;
+  }
+
+  // Lecture d'un QR code sur une image : lecteur intégré du téléphone si possible, sinon jsQR (hors ligne).
+  async function lireQR(c) {
+    if ("BarcodeDetector" in window) {
+      try {
+        const r = await new BarcodeDetector({ formats: ["qr_code"] }).detect(c);
+        if (r.length) return r[0].rawValue;
+      } catch (e) {}
+    }
+    try {
+      const k = Math.min(1, 1400 / Math.max(c.width, c.height));
+      const t = document.createElement("canvas");
+      t.width = Math.round(c.width * k); t.height = Math.round(c.height * k);
+      const x = t.getContext("2d"); x.drawImage(c, 0, 0, t.width, t.height);
+      const r = jsQR(x.getImageData(0, 0, t.width, t.height).data, t.width, t.height);
+      return r ? r.data : null;
+    } catch (e) { return null; }
+  }
+  // Si l'image est un profil Kerckhoffs, on propose de l'ouvrir au lieu de l'ajouter comme page.
+  async function estUnProfil(c) {
+    const t = await lireQR(c);
+    if (t && t.startsWith(PROFIL_PREFIXE)) { demanderOuverture(t); return true; }
+    return false;
+  }
+
+  function vue(nom) {
+    ["pfVueCreer", "pfVueQR", "pfVueOuvrir", "pfVueResume"].forEach((id) => { $(id).hidden = id !== nom; });
+    $("pfErreur").textContent = "";
+    $("profil").hidden = false;
+  }
+  function majProfilStatut() {
+    const p = profilActuel();
+    $("pfStatut").textContent = profilVide(p) ? "Aucun mot enregistré pour l'instant." : `Profil en cours : ${resume(p)}.`;
+  }
+
+  $("pfSave").addEventListener("click", () => {
+    if (profilVide(profilActuel())) { setStatus("Rien à enregistrer : ajoutez d'abord des noms ou des mots à masquer."); return; }
+    closeSheet(); $("pfPass").value = ""; $("pfPass2").value = ""; vue("pfVueCreer");
+  });
+  $("pfCreer").addEventListener("click", async () => {
+    const pass = $("pfPass").value;
+    if (pass.length < 12) { $("pfErreur").textContent = "Choisissez une phrase de passe d'au moins 12 caractères, par exemple quatre mots au hasard."; return; }
+    if (pass !== $("pfPass2").value) { $("pfErreur").textContent = "Les deux phrases de passe ne sont pas identiques."; return; }
+    const o = profilActuel();
+    const texte = await chiffrerProfil(o, pass);
+    const emp = await empreinte(o);
+    const d = new Date(), z = (n) => String(n).padStart(2, "0");
+    const c = dessinerQR(texte, `Profil Kerckhoffs · ${emp} · ${z(d.getDate())}.${z(d.getMonth() + 1)}.${d.getFullYear()}`);
+    if (!c) { $("pfErreur").textContent = "Le profil est trop grand pour un QR code. Retirez quelques mots."; return; }
+    profilSnapshot = JSON.stringify(o);
+    $("pfImage").src = c.toDataURL("image/png");
+    $("pfInfo").textContent = `Empreinte ${emp} · ${resume(o)}. Enregistrez cette image : elle est illisible sans votre phrase de passe.`;
+    $("pfImage").dataset.nom = `kerckhoffs-profil-${emp}.png`;
+    S.qrCanvas = c;
+    vue("pfVueQR");
+  });
+  $("pfEnregistrer").addEventListener("click", async () => {
+    const b = await blobOf(S.qrCanvas, "image/png");
+    save({ files: [new File([b], $("pfImage").dataset.nom, { type: "image/png" })] });
+    $("pfInfo").textContent = "QR code enregistré. Rangez aussi votre phrase de passe en lieu sûr.";
+  });
+  $("pfPartager").addEventListener("click", async () => {
+    const b = await blobOf(S.qrCanvas, "image/png");
+    const f = new File([b], $("pfImage").dataset.nom, { type: "image/png" });
+    try { await navigator.share({ files: [f] }); } catch (e) { if (e.name !== "AbortError") save({ files: [f] }); }
+  });
+
+  $("pfOpen").addEventListener("click", () => $("inProfil").click());
+  $("inProfil").addEventListener("change", async (e) => {
+    const f = e.target.files[0]; e.target.value = "";
+    if (!f) return;
+    closeSheet();
+    try {
+      const im = await loadImage(f);
+      if (!(await estUnProfil(toCanvas(im, im.width, im.height)))) setStatus("Aucun QR code de profil Kerckhoffs trouvé sur cette image.");
+    } catch (err) { setStatus("Impossible de lire cette image."); }
+  });
+  function demanderOuverture(texte) {
+    profilEnAttente = texte; $("pfPassOuvrir").value = ""; vue("pfVueOuvrir");
+  }
+  $("pfDechiffrer").addEventListener("click", async () => {
+    try {
+      const o = await dechiffrerProfil(profilEnAttente, $("pfPassOuvrir").value);
+      if (!o) throw new Error("format");
+      profilLu = o;
+      $("pfResume").textContent = `Ce profil contient ${resume(o)}. Empreinte : ${await empreinte(o)}.`;
+      vue("pfVueResume");
+    } catch (err) {
+      $("pfErreur").textContent = "Impossible d'ouvrir ce profil : phrase de passe incorrecte, ou QR code modifié.";
+    }
+  });
+  $("pfUtiliser").addEventListener("click", () => {
+    if (profilLu) appliquerProfil(profilLu);
+    profilLu = null; profilEnAttente = null;
+    $("profil").hidden = true;
+    setStatus("Profil chargé : ses mots seront masqués sur tous vos documents.");
+  });
+  document.querySelectorAll(".pfFermer").forEach((b) => b.addEventListener("click", () => {
+    $("profil").hidden = true; profilLu = null; profilEnAttente = null;
+  }));
+
+  // Fin de session : proposer de garder les mots appris
+  $("finGarder").addEventListener("click", () => { $("finSession").hidden = true; $("pfPass").value = ""; $("pfPass2").value = ""; vue("pfVueCreer"); });
+  $("finEffacer").addEventListener("click", () => { $("finSession").hidden = true; quitter(); });
+  $("finRester").addEventListener("click", () => { $("finSession").hidden = true; });
+
+  /* --------------------------- Cerbère : vérifier ce qui reste visible, avant d'envoyer */
+  // Tout se passe ici, sur l'appareil. Les règles et la liste des mots sensibles sont dans rules/cerbere.js.
+  let cerbereSuite = null;   // action à faire après le rapport : doShare ou doCopy
+  let cerbereItems = [];
+
+  function couvert(p) {
+    const trait = strokeMask(p);
+    return (x, y) => trait(x, y) || p.boxes.some((b) => b.active && (b.rects || [b]).some((r) =>
+      x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h));
+  }
+
+  // Applique une liste de règles aux mots visibles d'une ligne, et renvoie les zones trouvées.
+  function chercher(regles, mots) {
+    if (!mots.length) return [];
+    let raw = ""; const rr = [];
+    mots.forEach((w, i) => { if (i) raw += " "; rr.push([raw.length, raw.length + w.text.length]); raw += w.text; });
+    const out = [];
+    for (const r of regles) {
+      r.re.lastIndex = 0; let m;
+      while ((m = r.re.exec(raw))) {
+        if (!m[0].trim()) { r.re.lastIndex++; continue; }
+        const v = m[0].trim();
+        if (r.check && !r.check(v) && r.silent) continue;
+        const s = m.index, e = m.index + m[0].length;
+        const touches = mots.filter((w, i) => rr[i][0] < e && rr[i][1] > s);
+        out.push({ regle: r, texte: v, mots: touches });
+      }
+    }
+    return out;
+  }
+
+  const rectsDe = (mots) => mots.map((w) => {
+    const pad = Math.max(3, Math.round((w.bbox.y1 - w.bbox.y0) * 0.15));
+    return { x: w.bbox.x0 - pad, y: w.bbox.y0 - pad, w: w.bbox.x1 - w.bbox.x0 + 2 * pad, h: w.bbox.y1 - w.bbox.y0 + 2 * pad };
+  });
+
+  // Une zone touche-t-elle un endroit masqué ? (on écarte le « bruit » de lecture au bord des zones noires)
+  function presDuMasque(cache, b) {
+    const mx = (b.x1 - b.x0) * 0.25 + 4, my = (b.y1 - b.y0) * 0.4 + 4;
+    for (const x of [b.x0 - mx, (b.x0 + b.x1) / 2, b.x1 + mx]) for (const y of [b.y0 - my, (b.y0 + b.y1) / 2, b.y1 + my]) if (cache(x, y)) return true;
+    return false;
+  }
+
+  // Zones qui ressemblent à de l'écriture (petites taches sombres alignées) mais où aucun mot n'a été lu :
+  // un texte trop petit ou trop flou, une signature, un tampon. Ce que Kerckhoffs ne lit pas, une IA peut souvent le lire.
+  function zonesSansTexte(p, cache) {
+    const k = Math.min(1, 1200 / Math.max(p.img.width, p.img.height));
+    const W = Math.max(1, Math.round(p.img.width * k)), H = Math.max(1, Math.round(p.img.height * k));
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    x.drawImage(p.img, 0, 0, W, H);
+    const d = x.getImageData(0, 0, W, H).data, lum = new Uint8Array(W * H);
+    let somme = 0;
+    for (let i = 0; i < W * H; i++) { lum[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) | 0; somme += lum[i]; }
+    // Seuil assez haut pour attraper une écriture pâle ou floue, mais relatif au fond (papier blanc ou photo grise).
+    const seuil = Math.min(205, somme / (W * H) - 40);
+    const noir = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) noir[i] = lum[i] < seuil ? 1 : 0;
+    // On retire ce qui est déjà masqué et tous les mots déjà lus.
+    const effacer = (x0, y0, x1, y1) => {
+      for (let yy = Math.max(0, Math.floor(y0 * k)); yy < Math.min(H, Math.ceil(y1 * k)); yy++)
+        for (let xx = Math.max(0, Math.floor(x0 * k)); xx < Math.min(W, Math.ceil(x1 * k)); xx++) noir[yy * W + xx] = 0;
+    };
+    (p.lines || []).forEach((l) => l.words.forEach((w) => { const m = (w.bbox.y1 - w.bbox.y0) * 0.3; effacer(w.bbox.x0 - m, w.bbox.y0 - m, w.bbox.x1 + m, w.bbox.y1 + m); }));
+    for (let yy = 0; yy < H; yy++) for (let xx = 0; xx < W; xx++) if (noir[yy * W + xx] && cache((xx + 0.5) / k, (yy + 0.5) / k)) noir[yy * W + xx] = 0;
+    // Taches sombres, de la taille d'une lettre.
+    const vu = new Uint8Array(W * H), taches = [], pile = [];
+    for (let i = 0; i < W * H; i++) {
+      if (!noir[i] || vu[i]) continue;
+      let x0 = W, y0 = H, x1 = 0, y1 = 0, n = 0;
+      pile.push(i); vu[i] = 1;
+      while (pile.length) {
+        const j = pile.pop(), jx = j % W, jy = (j - jx) / W;
+        n++; if (jx < x0) x0 = jx; if (jx > x1) x1 = jx; if (jy < y0) y0 = jy; if (jy > y1) y1 = jy;
+        for (const v of [j - 1, j + 1, j - W, j + W]) {
+          if (v < 0 || v >= W * H || vu[v] || !noir[v]) continue;
+          if ((v === j - 1 && jx === 0) || (v === j + 1 && jx === W - 1)) continue;
+          vu[v] = 1; pile.push(v);
+        }
+      }
+      const h = y1 - y0 + 1, w = x1 - x0 + 1;
+      if (h >= 2 && h <= 30 && w <= 3 * h + 3 && n >= 3) taches.push({ x0, y0, x1, y1, h });
+      if (taches.length > 4000) return []; // trop de taches : une photo, une texture, pas du texte
+    }
+    // Les taches alignées et rapprochées forment une ligne d'écriture.
+    taches.sort((a, b) => a.x0 - b.x0);
+    const lignes = [];
+    for (const t of taches) {
+      const l = lignes.find((g) => t.x0 - g.x1 <= 1.8 * Math.max(g.h, t.h) && t.x0 >= g.x0 - 2 &&
+        Math.min(g.y1, t.y1) - Math.max(g.y0, t.y0) >= 0.4 * Math.min(g.h, t.h));
+      if (l) { l.x1 = Math.max(l.x1, t.x1); l.y0 = Math.min(l.y0, t.y0); l.y1 = Math.max(l.y1, t.y1); l.h = Math.max(l.h, t.h); l.n++; }
+      else lignes.push({ ...t, n: 1 });
+    }
+    return lignes.filter((l) => l.n >= 5 && l.x1 - l.x0 >= 4 * l.h)
+      .sort((a, b) => b.n - a.n).slice(0, 6)
+      .map((l) => { const m = l.h * 0.5; return { x: (l.x0 - m) / k, y: (l.y0 - m) / k, w: (l.x1 - l.x0 + 1 + 2 * m) / k, h: (l.y1 - l.y0 + 1 + 2 * m) / k }; });
+  }
+
+  /* Une signature : un grand tracé fin et courbe, plus haut qu'une ligne de texte, où la lecture ne trouve pas de mots.
+   * Les traits droits (tableaux, soulignés) et les grandes lettres pleines (logos) sont écartés. */
+  function signatures(p, cache) {
+    const k = Math.min(1, 1000 / Math.max(p.img.width, p.img.height));
+    const W = Math.max(1, Math.round(p.img.width * k)), H = Math.max(1, Math.round(p.img.height * k));
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    x.drawImage(p.img, 0, 0, W, H);
+    const d = x.getImageData(0, 0, W, H).data;
+    const hauteurs = (p.lines || []).flatMap((l) => l.words.filter((w) => w.conf == null || w.conf >= 60).map((w) => (w.bbox.y1 - w.bbox.y0) * k)).sort((a, b) => a - b);
+    const hT = hauteurs.length ? hauteurs[Math.floor(hauteurs.length / 2)] : 12;
+    // encre : sombre, ou bleue (stylo)
+    const encre = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2], l = r * 0.299 + g * 0.587 + b * 0.114;
+      if (l < 120 || (b > r + 30 && b > g + 15 && l < 200)) encre[i] = 1;
+    }
+    // les mots bien lus ne sont pas une signature
+    (p.lines || []).forEach((l) => l.words.forEach((w) => {
+      if (w.conf != null && w.conf < 60) return;
+      for (let yy = Math.max(0, Math.floor(w.bbox.y0 * k)); yy < Math.min(H, Math.ceil(w.bbox.y1 * k)); yy++)
+        for (let xx = Math.max(0, Math.floor(w.bbox.x0 * k)); xx < Math.min(W, Math.ceil(w.bbox.x1 * k)); xx++) encre[yy * W + xx] = 0;
+    }));
+    // un trait de signature est fin : on relie ses morceaux en grossissant un peu l'encre
+    const gros = new Uint8Array(W * H);
+    for (let yy = 1; yy < H - 1; yy++) for (let xx = 1; xx < W - 1; xx++) {
+      const i = yy * W + xx;
+      if (encre[i] || encre[i - 1] || encre[i + 1] || encre[i - W] || encre[i + W]) gros[i] = 1;
+    }
+    const vu = new Uint8Array(W * H), out = [], pile = [];
+    for (let i = 0; i < W * H; i++) {
+      if (!gros[i] || vu[i]) continue;
+      let x0 = W, y0 = H, x1 = 0, y1 = 0, n = 0, visibles = 0;
+      const pts = [];
+      pile.push(i); vu[i] = 1;
+      while (pile.length) {
+        const j = pile.pop(), jx = j % W, jy = (j - jx) / W;
+        if (encre[j]) { n++; pts.push(j); if (!cache((jx + 0.5) / k, (jy + 0.5) / k)) visibles++; }
+        if (jx < x0) x0 = jx; if (jx > x1) x1 = jx; if (jy < y0) y0 = jy; if (jy > y1) y1 = jy;
+        for (const v of [j - 1, j + 1, j - W, j + W, j - W - 1, j - W + 1, j + W - 1, j + W + 1]) {
+          if (v < 0 || v >= W * H || vu[v] || !gros[v]) continue;
+          const vx = v % W; if (Math.abs(vx - jx) > 1) continue;
+          vu[v] = 1; pile.push(v);
+        }
+        if (pts.length > 60000) break;
+      }
+      const w = x1 - x0 + 1, h = y1 - y0 + 1;
+      if (h < 2.2 * hT || h > 0.3 * H || w < 2.4 * hT || w > 0.6 * W) continue;
+      if (n / (w * h) > 0.16 || n < 40) continue;          // trop plein : un logo, un tampon rempli
+      if (visibles / n < 0.4) continue;                       // déjà masquée pour l'essentiel
+      // un long trait droit, horizontal ou vertical : un tableau, un souligné
+      const lignes = new Uint16Array(h), colonnes = new Uint16Array(w);
+      pts.forEach((j) => { const jx = j % W, jy = (j - jx) / W; lignes[jy - y0]++; colonnes[jx - x0]++; });
+      if (Math.max(...lignes) > 0.6 * w || Math.max(...colonnes) > 0.6 * h) continue;
+      const m = hT * 0.4;
+      out.push({ x: (x0 - m) / k, y: (y0 - m) / k, w: (w + 2 * m) / k, h: (h + 2 * m) / k });
+      if (out.length >= 3) break;
+    }
+    return out;
+  }
+
+  /* « Ça dépasse ici » : juste à l'extérieur de chaque bord d'un rectangle tracé à la main, on cherche de l'encre.
+   * Les traits d'un tableau (une ligne sombre sur presque toute la longueur) ne comptent pas : ce n'est pas de l'écriture. */
+  function encreDansBande(p, b, vertical, cache) {
+    const px = pixelsDe(p, b.x, b.y, b.x + b.w, b.y + b.h);
+    if (!px) return false;
+    const { X0, Y0, W, H, lum } = px;
+    const n1 = vertical ? W : H, n2 = vertical ? H : W; // n1 : travers la bande, n2 : le long du bord
+    let encre = 0;
+    for (let a = 0; a < n1; a++) {
+      let s = 0;
+      for (let c = 0; c < n2; c++) { const x = vertical ? a : c, y = vertical ? c : a; if (lum[y * W + x] < 140 && !cache(X0 + x + 0.5, Y0 + y + 0.5)) s++; }
+      if (s / n2 > 0.6) continue; // un trait de tableau
+      encre += s;
+    }
+    return encre >= Math.max(6, n1 * n2 * 0.02);
+  }
+  function bordsQuiDepassent(p, cache) {
+    const out = [];
+    const e = Math.max(3, Math.round(Math.min(p.img.width, p.img.height) * 0.004));
+    p.strokes.forEach((st) => {
+      if (st.kind !== "rect" || st.w < 6 || st.h < 6) return;
+      const cotes = [
+        ["g", { x: st.x - e, y: st.y, w: e, h: st.h }, true], ["d", { x: st.x + st.w, y: st.y, w: e, h: st.h }, true],
+        ["h", { x: st.x, y: st.y - e, w: st.w, h: e }, false], ["b", { x: st.x, y: st.y + st.h, w: st.w, h: e }, false],
+      ];
+      for (const [cote, bande, vertical] of cotes) {
+        if (bande.x < 0 || bande.y < 0 || bande.x + bande.w > p.img.width || bande.y + bande.h > p.img.height) continue;
+        if (encreDansBande(p, bande, vertical, cache)) out.push({ st, cote, bande: { x: bande.x - e, y: bande.y - e, w: bande.w + 2 * e, h: bande.h + 2 * e } });
+      }
+    });
+    return out.slice(0, 12);
+  }
+  // Élargir : le bord avance jusqu'à ce qu'il n'y ait plus d'encre juste derrière (au plus de quelques lettres).
+  function elargir(p, d) {
+    const st = d.st, e = Math.max(3, Math.round(Math.min(p.img.width, p.img.height) * 0.004));
+    const avant = { x: st.x, y: st.y, w: st.w, h: st.h };
+    const cache = couvert(p);
+    for (let i = 0; i < 60; i++) {
+      const b = d.cote === "g" ? { x: st.x - e, y: st.y, w: e, h: st.h } : d.cote === "d" ? { x: st.x + st.w, y: st.y, w: e, h: st.h }
+        : d.cote === "h" ? { x: st.x, y: st.y - e, w: st.w, h: e } : { x: st.x, y: st.y + st.h, w: st.w, h: e };
+      if (b.x < 0 || b.y < 0 || b.x + b.w > p.img.width || b.y + b.h > p.img.height) break;
+      if (!encreDansBande(p, b, d.cote === "g" || d.cote === "d", cache)) break;
+      if (d.cote === "g") { st.x -= e; st.w += e; } else if (d.cote === "d") st.w += e; else if (d.cote === "h") { st.y -= e; st.h += e; } else st.h += e;
+    }
+    // un peu de marge, pour couvrir le bord des lettres
+    if (d.cote === "g") { st.x -= e; st.w += e; } else if (d.cote === "d") st.w += e; else if (d.cote === "h") { st.y -= e; st.h += e; } else st.h += e;
+    st.moy = null;
+    history.push({ type: "resize", page: p, item: st, avant });
+  }
+
+  // Les combinaisons qui trahissent : un code postal, un âge, le sexe, une information de santé.
+  const COMBINAISON = [
+    { cat: "un code postal", re: /\b(?:[A-Z]{1,2}-)?\d{4,5}\s+[A-ZÀ-Ý][a-zà-ÿ'’-]{2,}/g },
+    { cat: "un âge ou une date de naissance", re: /\b\d{1,3}\s?(?:ans|years?|Jahre)\b|\b(?:âge|age|alter)\s*:?\s*\d{1,3}\b|\b(?:née?|naissance|geboren|born)\b/gi },
+    { cat: "une situation professionnelle", re: /\b(?:chômage|chomage|chômeu(?:r|se)|sans emploi|demandeu(?:r|se) d'emploi|licencié(?:e)?|licenciement|en recherche d'emploi|arbeitslos)/gi },
+    { cat: "le sexe", re: /\b(?:homme|femme|masculin|féminin|feminin|männlich|weiblich|male|female)\b|\bsexe\s*:?\s*[MFmf]\b/gi },
+  ];
+
+  async function analyserCerbere() {
+    const items = [];
+    const combinaison = new Map(); // catégorie -> { mots, texte }
+    const sensibles = K.cerbere.sensibles.map((s) => ({ ...s, n: s.exact ? s.mot : norm(s.mot) }));
+    const detection = rules().concat(S.extra, [{ id: "date", type: "DATE", re: DATE_RE() }]);
+    for (const [pi, p] of S.pages.entries()) {
+      await ocr(p);
+      if (p.kOff) {
+        // K:OFF : la lecture ne sert à rien ici ; c'est à vous de relire toute la page.
+        items.push({ tete: 0, page: pi, label: "K:OFF : Kerckhoffs ne lit pas cette page", texte: "relisez-la entièrement vous-même", rects: [{ x: 0, y: 0, w: p.img.width, h: p.img.height }], kOff: true });
+        continue;
+      }
+      const cache = couvert(p);
+      const vu = new Set();
+      const ajouter = (it) => {
+        const k = it.label + "|" + it.texte;
+        if (vu.has(k)) { const old = items.find((x) => x.page === pi && x.label + "|" + x.texte === k); if (old) old.rects.push(...it.rects); return; }
+        vu.add(k); items.push({ ...it, page: pi });
+      };
+      for (const line of p.lines) {
+        // Mots visibles et lus avec assez d'assurance (on écarte le « bruit » de lecture, par exemple au bord des zones noires).
+        const visibles = line.words.filter((w) => (w.conf == null || w.conf >= 60) && !cache((w.bbox.x0 + w.bbox.x1) / 2, (w.bbox.y0 + w.bbox.y1) / 2));
+        // Tête 1 : noms probables
+        chercher(K.cerbere.regles, visibles).forEach((h) => {
+          const mots = h.regle.id === "nom-titre" ? h.mots.slice(1) : h.mots; // on garde la civilité visible
+          if (mots.length) ajouter({ tete: 1, label: h.regle.label, texte: mots.map((w) => w.text).join(" "), rects: rectsDe(mots) });
+        });
+        // Tête 1 bis : valeur encore visible après une étiquette (« Nom : », « Né le »…)
+        if (visibles.length) {
+          let raw = ""; const rr = [];
+          visibles.forEach((w, i) => { if (i) raw += " "; rr.push([raw.length, raw.length + w.text.length]); raw += w.text; });
+          K.valeursApresEtiquettes(raw).forEach((v) => {
+            const mots = visibles.filter((w, i) => rr[i][0] < v.fin && rr[i][1] > v.debut);
+            if (mots.length) ajouter({ tete: 1, label: "Après l'étiquette « " + v.etiquette.mots[0] + " »", texte: v.valeur, rects: rectsDe(mots) });
+          });
+        }
+        // Tête 3 : numéros, dates, adresses encore visibles
+        const dejaVus = new Set();
+        chercher(detection, visibles).forEach((h) => { dejaVus.add(h.texte); ajouter({ tete: 3, label: "Encore visible : " + h.regle.type.toLowerCase(), texte: h.texte, rects: rectsDe(h.mots) }); });
+        // Tête 3 bis : ce qui a la forme d'un identifiant (lettres et chiffres mêlés, groupes de chiffres…)
+        if (visibles.length) {
+          let raw = ""; const rr = [];
+          visibles.forEach((w, i) => { if (i) raw += " "; rr.push([raw.length, raw.length + w.text.length]); raw += w.text; });
+          for (const c of K.candidatsIdentifiant(raw)) {
+            if (dejaVus.has(c.valeur) || [...vu].some((v) => v.endsWith("|" + c.valeur))) continue;
+            const mots = visibles.filter((w, i) => rr[i][0] < c.fin && rr[i][1] > c.debut);
+            if (mots.length) ajouter({ tete: 3, label: "Ressemble à un identifiant", texte: c.valeur, rects: rectsDe(mots) });
+          }
+          // Les combinaisons qui trahissent
+          for (const g of COMBINAISON) {
+            g.re.lastIndex = 0; let m;
+            while ((m = g.re.exec(raw))) {
+              const mots = visibles.filter((w, i) => rr[i][0] < m.index + m[0].length && rr[i][1] > m.index);
+              if (!mots.length) continue;
+              if (!combinaison.has(g.cat)) combinaison.set(g.cat, { texte: m[0].trim(), mots: [] });
+              combinaison.get(g.cat).mots.push(...mots);
+            }
+          }
+        }
+        // Mots mal lus, hors des bords des zones masquées : le moteur a vu quelque chose sans être sûr de quoi.
+        const malLus = line.words.filter((w) => w.conf != null && w.conf < 60 && /[A-Za-z0-9].*[A-Za-z0-9]/.test(w.text) &&
+          !presDuMasque(cache, w.bbox));
+        if (malLus.length) ajouter({ tete: 4, label: "Lecture incertaine ici", texte: "écriture difficile à lire", rects: rectsDe(malLus), nonLu: true });
+        // Tête 2 : mots sensibles (signalés, à laisser si l'IA en a besoin)
+        // « e » garde les majuscules ; la lecture confond souvent I et l (« Al » pour « AI ») : on corrige pour les mots courts.
+        const brut = (t) => { const s = t.replace(/[.,;:()«»"]/g, ""); return s.length <= 3 ? s.replace(/l/g, "I") : s; };
+        const texteNorm = visibles.map((w) => ({ w, n: norm(w.text.replace(/[.,;:()«»"]/g, "")), e: brut(w.text) }));
+        for (const s of sensibles) {
+          const parts = s.n.split(/\s+/);
+          for (let i = 0; i + parts.length <= texteNorm.length; i++) {
+            const ok = parts.every((pt, j) => (s.exact ? texteNorm[i + j].e === pt : texteNorm[i + j].n === pt));
+            if (ok) {
+              const mots = texteNorm.slice(i, i + parts.length).map((x) => x.w);
+              ajouter({ tete: 2, label: "Mot sensible", texte: s.mot, rects: rectsDe(mots), info: true });
+              if (s.sante) {
+                if (!combinaison.has("une information de santé")) combinaison.set("une information de santé", { texte: s.mot, mots: [] });
+                combinaison.get("une information de santé").mots.push(...mots);
+              }
+            }
+          }
+        }
+      }
+      // Tête 3 : codes-barres et codes 2D, quand le téléphone sait les reconnaître (hors ligne)
+      if ("BarcodeDetector" in window) {
+        try {
+          const formats = await BarcodeDetector.getSupportedFormats();
+          const codes = await new BarcodeDetector({ formats }).detect(p.img);
+          codes.forEach((c) => {
+            const b = c.boundingBox;
+            let vus = 0, total = 0;
+            for (let gx = 0; gx <= 4; gx++) for (let gy = 0; gy <= 4; gy++) {
+              total++; if (!cache(b.x + (b.width * gx) / 4, b.y + (b.height * gy) / 4)) vus++;
+            }
+            if (vus / total > 0.2) ajouter({ tete: 3, label: "Code-barres ou code 2D", texte: c.format.replace(/_/g, " "), rects: [{ x: b.x - 6, y: b.y - 6, w: b.width + 12, h: b.height + 12 }] });
+          });
+        } catch (e) { /* pas de lecteur de codes sur cet appareil */ }
+      }
+      // Tête 3 : un code-barres reconnu à sa forme (des barres verticales serrées), même sans lecteur de codes sur l'appareil.
+      try {
+        codesBarresForme(p).forEach((r) => {
+          if (items.some((it) => it.page === pi && it.label === "Code-barres ou code 2D" && it.rects.some((q) => q.x < r.x + r.w && r.x < q.x + q.w && q.y < r.y + r.h && r.y < q.y + q.h))) return;
+          let vus = 0, total = 0;
+          for (let gx = 0; gx <= 4; gx++) for (let gy = 0; gy <= 2; gy++) { total++; if (!cache(r.x + (r.w * gx) / 4, r.y + (r.h * gy) / 2)) vus++; }
+          if (vus / total > 0.3) ajouter({ tete: 3, label: "Code-barres ou code 2D", texte: "des barres verticales serrées, souvent un numéro de dossier", rects: [r] });
+        });
+      } catch (e) {}
+      // Tête 4 : écriture que la lecture n'a pas su lire du tout
+      try {
+        zonesSansTexte(p, cache).forEach((r) => ajouter({ tete: 4, label: "Écriture non lue ici", texte: "texte trop petit, flou, ou manuscrit", rects: [r], nonLu: true }));
+      } catch (e) { /* analyse impossible sur cette image */ }
+      // Tête 1 ter : une signature manuscrite (au choix : la masquer ou la laisser)
+      try { signatures(p, cache).forEach((r) => ajouter({ tete: 1, label: "Signature manuscrite ici", texte: "une signature peut faire reconnaître une personne", rects: [r] })); } catch (e) {}
+      // Tête 3 ter : de l'encre qui touche le bord d'un rectangle tracé à la main (un mot qui continue sous le noir)
+      try { bordsQuiDepassent(p, cache).forEach((d) => ajouter({ tete: 3, label: "Ça dépasse ici", texte: "de l'écriture touche le bord du masque", rects: [d.bande], depasse: d })); } catch (e) {}
+      // Deux catégories ou plus encore visibles : on prévient, page par page.
+      if (combinaison.size >= 2) {
+        for (const [cat, v] of combinaison) items.push({ tete: 0, page: pi, label: "Peut identifier avec le reste : " + cat, texte: v.texte, rects: rectsDe(v.mots), combinaison: true });
+      }
+      combinaison.clear();
+    }
+    // Les regroupements faits à la main : un groupe qui mélange des types, ou le même texte dans deux groupes différents.
+    // Kerckhoffs ne corrige rien : « Aller voir », ou « Masquer sans étiquette » (un rectangle neutre, sans lettre).
+    const parJeton = new Map();
+    elementsEtiquetes().forEach((e) => {
+      const t = e.box ? e.box.token : jetonTrait(e.stroke);
+      if (/^\[(MASQUÉ|MASKED)\]$/.test(t)) return;
+      if (!parJeton.has(t)) parJeton.set(t, []);
+      parJeton.get(t).push(e);
+    });
+    const surPage = (els) => { const pi = els[0].pi; return { page: pi, rects: els.filter((e) => e.pi === pi).flatMap((e) => e.rects) }; };
+    const parValeur = new Map();
+    for (const [t, els] of parJeton) {
+      if (els.length < 2) continue;
+      const types = [...new Set(els.map((e) => e.type))];
+      if (types.length > 1) items.push({ tete: 0, ...surPage(els), label: "Ce groupe mélange plusieurs types (" + types.map((x) => x.toLowerCase()).join(", ") + ")", texte: t, groupe: els });
+      els.forEach((e) => { const v = norm(String(e.value || "")).trim(); if (!v) return; if (!parValeur.has(v)) parValeur.set(v, new Map()); parValeur.get(v).set(t, e); });
+    }
+    for (const [, m] of parValeur) {
+      if (m.size < 2) continue;
+      const els = [...m.keys()].flatMap((t) => parJeton.get(t));
+      items.push({ tete: 0, ...surPage(els), label: "Le même texte se trouve dans deux groupes différents", texte: [...m.keys()].join(" et "), groupe: els });
+    }
+    return items.sort((a, b) => a.tete - b.tete);
+  }
+  /* Un code-barres à sa forme : sur une copie de 1600 pixels de large au plus, des cases où l'encre change très souvent de gauche
+   * à droite (beaucoup de barres) ET reste identique de haut en bas (des barres, pas des lettres). Les cases voisines
+   * s'assemblent en un rectangle ; un rectangle assez large est signalé. */
+  function codesBarresForme(p) {
+    const W = Math.min(1600, p.img.width), k = p.img.width / W, H = Math.max(1, Math.round(p.img.height / k));
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    const x = c.getContext("2d", { willReadFrequently: true }); x.drawImage(p.img, 0, 0, W, H);
+    const d = x.getImageData(0, 0, W, H).data, n = new Uint8Array(W * H);
+    const g = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) g[i] = d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114;
+    const tri = Float32Array.from(g).sort(), fond = tri[Math.floor(tri.length * 0.6)];
+    for (let i = 0; i < W * H; i++) n[i] = g[i] < fond - 50 ? 1 : 0;
+    const CW = 40, CH = 4, cols = Math.floor(W / CW), rows = Math.floor((H - 12) / CH), marque = new Uint8Array(cols * rows);
+    for (let ry = 0; ry < rows; ry++) for (let cx = 0; cx < cols; cx++) {
+      const y = ry * CH, x0 = cx * CW;
+      let trans = 0, pareil = 0, encre = 0;
+      for (let xx = x0 + 1; xx < x0 + CW; xx++) if (n[y * W + xx] !== n[y * W + xx - 1]) trans++;
+      for (let xx = x0; xx < x0 + CW; xx++) { const a = n[y * W + xx]; encre += a; if (a === n[(y + 6) * W + xx] && a === n[(y + 12) * W + xx]) pareil++; }
+      if (trans >= 6 && pareil / CW >= 0.9 && encre >= CW * 0.2 && encre <= CW * 0.8) marque[ry * cols + cx] = 1;
+    }
+    // Assembler les cases marquées voisines
+    const vu = new Uint8Array(cols * rows), out = [];
+    for (let i = 0; i < marque.length; i++) {
+      if (!marque[i] || vu[i]) continue;
+      const pile = [i]; vu[i] = 1; let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, nb = 0;
+      while (pile.length) {
+        const j = pile.pop(), cx = j % cols, ry = (j - cx) / cols; nb++;
+        x0 = Math.min(x0, cx); x1 = Math.max(x1, cx); y0 = Math.min(y0, ry); y1 = Math.max(y1, ry);
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [2, 0], [-2, 0], [3, 0], [-3, 0], [1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+          const a = cx + dx, b = ry + dy, q = b * cols + a;
+          if (a >= 0 && a < cols && b >= 0 && b < rows && marque[q] && !vu[q]) { vu[q] = 1; pile.push(q); }
+        }
+      }
+      const larg = (x1 - x0 + 1) * CW, haut = (y1 - y0 + 1) * CH + 12;
+      // Une marge autour : les barres du bord, moins régulières, et souvent le numéro imprimé juste dessous.
+      if (larg >= 120 && haut >= 18 && nb >= 6) { const mx = CW, my = haut * 0.6; out.push({ x: (x0 * CW - mx) * k, y: (y0 * CH - 6) * k, w: (larg + 2 * mx) * k, h: (haut + 6 + my) * k }); }
+    }
+    return out;
+  }
+  function allerVoir(it) { fermerCerbere(); montrer(it); setStatus("Corrigez le regroupement (toucher l'élément, puis Relier… ou Détacher), puis renvoyez.", true); }
+
+  function afficherCerbere() {
+    const ul = $("cerbereList");
+    ul.textContent = "";
+    const restants = cerbereItems.filter((it) => !it.fait);
+    const nl = restants.filter((it) => it.nonLu).length;
+    $("cerbereIntro").textContent = (balayageInfo ? balayageInfo + " " : "") + (restants.length
+      ? `${restants.length} point${restants.length > 1 ? "s" : ""} à vérifier dans ce qui reste visible.` +
+        (nl && !strict ? ` Dont ${nl} zone${nl > 1 ? "s" : ""} d'écriture non lue${nl > 1 ? "s" : ""}, en orange sur l'image : ${nl > 1 ? "elles seraient" : "elle serait"} à vérifier au niveau Strict.` : "")
+      : "Rien à signaler. Vous pouvez envoyer.");
+    $("cerbereAlerte").hidden = !restants.some((it) => it.combinaison);
+    $("cerbereBalayage").hidden = strict;
+    S.orange = restants.filter((it) => it.nonLu);
+    render();
+    $("cerbereSend").textContent = strict ? "Aperçu final" : (restants.length ? "Envoyer quand même" : "Envoyer");
+    $("cerbereSend").hidden = strict && restants.length > 0; // en mode strict : tout traiter d'abord
+    $("cerbereStrictNote").hidden = !(strict && restants.length > 0);
+    // La mention qui partira avec le document, avant l'envoi et pas après.
+    const men = $("cerbereMention"); men.textContent = "";
+    if ($("optMask").checked) {
+      men.append(document.createTextNode(avecMention() ? `Ce document portera en bas la mention « ${texteMention()} ».` : "Ce document partira sans mention."));
+      if (strict) {
+        const b = document.createElement("button"); b.type = "button"; b.className = "btn small";
+        b.textContent = avecMention() ? "La retirer" : "La remettre";
+        b.addEventListener("click", () => { $("optMention").checked = !$("optMention").checked; changed(); cerbereOk = -1; afficherCerbere(); });
+        men.append(b);
+      } else men.append(document.createTextNode(" Seul le niveau Strict permet de la retirer."));
+    }
+    // Trois points à la fois : la photo garde les deux tiers de l'écran. Les suivants arrivent quand un point est traité.
+    restants.slice(0, 3).forEach((it) => {
+      const li = document.createElement("li");
+      li.className = "cerbere-item" + (it.nonLu ? " non-lu" : "");
+      const t = document.createElement("button");
+      t.type = "button"; t.className = "cerbere-voir";
+      const l = document.createElement("strong"); l.textContent = it.label;
+      const v = document.createElement("span"); v.textContent = "« " + it.texte + " »" + (S.pages.length > 1 ? ` · page ${it.page + 1}` : "");
+      t.append(l, v);
+      // Un toucher : l'image montre le point. Deux touchers : il reste seul en bas.
+      t.addEventListener("click", () => {
+        const now = performance.now();
+        if (dernierClic.it === it && now - dernierClic.t < 450) { dernierClic = {}; modeUn(it); return; }
+        dernierClic = { it, t: now };
+        montrer(it);
+      });
+      const m = document.createElement("button"); m.type = "button"; m.className = "btn small dark"; m.textContent = it.groupe ? "Masquer sans étiquette" : it.depasse ? "Élargir" : "Masquer";
+      m.addEventListener("click", () => { traiter(it, true); afficherCerbere(); });
+      const g = document.createElement("button"); g.type = "button"; g.className = "btn small"; g.textContent = it.groupe ? "Aller voir" : it.kOff ? "J'ai relu" : "Laisser";
+      g.addEventListener("click", () => { if (it.groupe) { allerVoir(it); return; } traiter(it, false); afficherCerbere(); });
+      if (it.kOff) m.hidden = true;
+      const act = document.createElement("div"); act.className = "cerbere-act"; act.append(m, g);
+      li.append(t, act);
+      ul.append(li);
+    });
+    if (restants.length > 3) {
+      const li = document.createElement("li"); li.className = "cerbere-plus";
+      li.textContent = `+ ${restants.length - 3} autre${restants.length - 3 > 1 ? "s" : ""} point${restants.length - 3 > 1 ? "s" : ""}, juste après`;
+      ul.append(li);
+    }
+  }
+  let dernierClic = {};
+  function traiter(it, masquer) {
+    const p = S.pages[it.page];
+    if (masquer && it.groupe) {
+      it.groupe.forEach((e) => { S.sansEtiquette.add(e.occ); if (S.groupes) S.groupes.delete(e.occ); });
+      attribuerJetons();
+    } else if (masquer) { if (it.depasse) elargir(p, it.depasse); else it.rects.forEach((r) => maskRect(p, r)); }
+    it.fait = true; S.flash = null;
+    if (masquer) afterEdit(); else render();
+  }
+  // Un seul point en bas : Masquer, Laisser, ou la flèche en haut à gauche pour revenir à la liste.
+  function modeUn(it) {
+    S.rbfUn = it;
+    $("cerbere").hidden = true; majPanneau();
+    $("rbfUnLabel").textContent = it.label;
+    $("rbfUnTexte").textContent = "« " + it.texte + " »" + (S.pages.length > 1 ? ` · page ${it.page + 1}` : "");
+    $("rbfUnMasquer").textContent = it.groupe ? "Masquer sans étiquette" : it.depasse ? "Élargir" : "Masquer";
+    $("rbfUnMasquer").hidden = !!it.kOff;
+    $("rbfUnLaisser").textContent = it.groupe ? "Aller voir" : it.kOff ? "J'ai relu" : "Laisser";
+    $("rbfUn").hidden = false;
+    $("work").classList.add("mode-un");
+    $("undo").disabled = false; $("undo").setAttribute("aria-label", "Revenir à la liste");
+    montrer(it);
+  }
+  function retourListe() {
+    S.rbfUn = null;
+    $("rbfUn").hidden = true;
+    $("work").classList.remove("mode-un");
+    $("undo").setAttribute("aria-label", "Annuler le dernier geste"); updateUndo();
+    $("cerbere").hidden = false; majPanneau();
+    afficherCerbere();
+  }
+  $("rbfUn").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("rbfUnMasquer").addEventListener("click", () => { if (S.rbfUn) traiter(S.rbfUn, true); retourListe(); });
+  $("rbfUnLaisser").addEventListener("click", () => {
+    const it = S.rbfUn;
+    if (it && it.groupe) { S.rbfUn = null; $("rbfUn").hidden = true; $("work").classList.remove("mode-un"); updateUndo(); allerVoir(it); return; }
+    if (it) traiter(it, false); retourListe();
+  });
+
+  // Montrer un point : l'image zoome dessus, dans la partie de l'écran qui reste visible (au-dessus de la liste).
+  function montrer(it) {
+    if (it.page !== S.cur) { S.cur = it.page; fitView(); updateUI(); }
+    S.flash = { page: S.pages[it.page], rects: it.rects };
+    const vr = vp.getBoundingClientRect();
+    let haut = vr.height;
+    for (const id of ["cerbere", "rbfUn"]) {
+      const el = $(id);
+      if (!el.hidden) { const r = el.getBoundingClientRect(); if (r.left < vr.left + vr.width / 2 && r.top > vr.top) haut = Math.min(haut, r.top - vr.top); }
+    }
+    const z = unionDe(it.rects);
+    fitView();
+    const s = Math.min(S.view.fit * 6, Math.max(S.view.fit * 1.2, Math.min((vr.width * 0.6) / Math.max(z.w, 1), (haut * 0.45) / Math.max(z.h, 1))));
+    S.view.s = s; S.view.tx = vr.width / 2 - (z.x + z.w / 2) * s; S.view.ty = Math.max(40, haut / 2) - (z.y + z.h / 2) * s;
+    applyView(); showFit();
+    render();
+  }
+
+  // Remove Before Flight, niveau Strict (par défaut) : chaque point doit être traité, dernière relecture automatique,
+  // puis l'aperçu final. Niveau Normal : la liste ne s'affiche que s'il reste quelque chose à vérifier.
+  // Dans les deux niveaux, rien ne part sans l'aperçu final et la case d'autorisation cochée.
+  let strict = true;
+  try { strict = localStorage.getItem("kerckhoffs-strict") !== "0"; } catch (e) {}
+  function majNiveau() {
+    $("niveauStrict").checked = strict; $("niveauNormal").checked = !strict; $("optStrict").checked = strict;
+    $("niveauNote").textContent = strict
+      ? "Strict : chaque point vous est soumis (laisser ou masquer), Kerckhoffs fait une dernière relecture, puis l'aperçu final s'affiche avant l'envoi."
+      : "Normal : la liste ne s'affiche que s'il reste quelque chose à vérifier, et la mention reste toujours en bas du document. L'aperçu final s'affiche aussi avant chaque envoi.";
+    $("optMention").disabled = !strict;
+    if (!strict) $("optMention").checked = true;
+  }
+  majNiveau();
+  document.querySelectorAll('input[name="niveau"]').forEach((r) => r.addEventListener("change", () => {
+    strict = r.value === "strict";
+    try { localStorage.setItem("kerckhoffs-strict", strict ? "1" : "0"); } catch (e) {}
+    majNiveau(); cerbereOk = -1; changed(); render();
+  }));
+  $("optMention").addEventListener("change", () => { changed(); });
+
+  let balayageInfo = "", cerbereSansEnvoi = false;
+
+  // Dernier balayage : tout ce qui a été masqué quelque part (par vous ou par Kerckhoffs) est cherché partout ailleurs.
+  async function dernierBalayage() {
+    if (busy) return [];
+    const vus = new Set((S.balayage || []).map((t) => t.key));
+    const ajout = [];
+    const actifs = new Set(S.pages.flatMap((p) => p.boxes.filter((b) => b.active).map((b) => b.token)));
+    for (const t of S.tokens.values()) {
+      if (!actifs.has(t.token) || t.type === "DATE" || t.type === "ZONE") continue;
+      const v = String(t.value).trim();
+      if (v.length < 3) continue;
+      const chiffres = v.replace(/\D/g, "");
+      if (chiffres.length >= 6) {
+        const r = numeroVersRegle(chiffres); r.id = "balayage-" + chiffres; r.type = t.type;
+        if (!S.extra.some((x) => x.id === r.id)) S.extra.push(r);
+        continue;
+      }
+      if (/\d/.test(v) || !K.motsACherche(v).length) continue;
+      const key = t.type + "|" + norm(v);
+      if (vus.has(key)) continue;
+      vus.add(key); ajout.push({ type: t.type, value: v, key });
+    }
+    S.balayage = (S.balayage || []).concat(ajout);
+    const avant = instantane();
+    await detectPages(S.pages, () => "");
+    return nouveaux(avant);
+  }
+  $("cerbereBalayage").addEventListener("click", async () => {
+    $("cerbereBalayage").disabled = true;
+    const items = await dernierBalayage();
+    balayageInfo = items.length ? `Dernier balayage : ${items.length} élément${items.length > 1 ? "s" : ""} de plus masqué${items.length > 1 ? "s" : ""}.` : "Dernier balayage : rien de nouveau.";
+    try { cerbereItems = await analyserCerbere(); } catch (e) {}
+    $("cerbereBalayage").disabled = false;
+    afficherCerbere();
+    if (items.length) montrerTrouves(items, true);
+  });
+
+  async function avecCerbere(action, sansEnvoi) {
+    cerbereSansEnvoi = !!sansEnvoi; balayageInfo = "";
+    attribuerJetons(); render(); // les lettres définitives (A, B, C… dans l'ordre), avant le contrôle et l'aperçu
+    // Sans masquage, ou document déjà validé et inchangé : on envoie tout de suite, sans contrôle ni animation.
+    if (!$("optMask").checked || (cerbereOk === S.version && !strict)) { if (cerbereSansEnvoi) return action(); ouvrirApercu(action); return; }
+    let attendu = false;
+    if (busy) { // lecture en cours : on attend qu'elle finisse, puis Cerbère vérifie
+      attendu = true;
+      setStatus("Lecture du texte en cours, le contrôle « Remove Before Flight » suit juste après…", true);
+      while (busy) await new Promise((r) => setTimeout(r, 300));
+    }
+    const direct = !attendu && S.pages.every((p) => p.lines);
+    // En mode strict, le dernier balayage est automatique.
+    if (strict) {
+      setStatus("Dernier balayage…", true);
+      const nv = await dernierBalayage();
+      balayageInfo = nv.length ? `Dernier balayage : ${nv.length} élément${nv.length > 1 ? "s" : ""} de plus masqué${nv.length > 1 ? "s" : ""}.` : "Dernier balayage : rien de nouveau.";
+      if (nv.length) montrerTrouves(nv, true);
+    }
+    let items;
+    try { setStatus("Vérification de ce qui reste visible…", true); items = await analyserCerbere(); }
+    catch (e) { items = []; }
+    setStatus("");
+    if (!items.length && direct && !strict) {
+      cerbereOk = S.version; render();
+      if (sansEnvoi) { await action(); return; }
+      setStatus("Remove Before Flight : rien à signaler, bon vol.");
+      apresValidation(action);
+      return;
+    }
+    cerbereItems = items; cerbereSuite = action;
+    closeSheet();
+    $("cerbere").hidden = false; // sans voile sombre : l'image reste visible au-dessus
+    majPanneau();
+    afficherCerbere();
+  }
+  function fermerCerbere() {
+    $("cerbere").hidden = true; $("backdrop").hidden = true; S.flash = null; S.orange = null;
+    S.rbfUn = null; $("rbfUn").hidden = true; $("work").classList.remove("mode-un"); updateUndo();
+    majPanneau(); render();
+  }
+  $("cerbereBack").addEventListener("click", fermerCerbere);
+  $("cerbereSend").addEventListener("click", () => {
+    const suite = cerbereSuite;
+    cerbereOk = S.version; fermerCerbere(); // fermerCerbere redessine : le filigrane disparaît
+    if (cerbereSansEnvoi) { if (suite) suite(); return; }
+    apresValidation(suite);
+  });
+
+  /* ---------------- le document part : les zones masquées tombent comme du sable, puis l'image envoyée se pose */
+  let animOn = true;
+  try { animOn = localStorage.getItem("kerckhoffs-animation") !== "0"; } catch (e) {}
+  const reduireMouvements = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const animationPossible = () => animOn && !reduireMouvements() && $("optMask").checked && !!page();
+  function majAnim() { $("optAnim").checked = animOn; }
+  function choisirAnim(v) { animOn = v; try { localStorage.setItem("kerckhoffs-animation", v ? "1" : "0"); } catch (e) {} majAnim(); }
+  majAnim();
+  $("optAnim").addEventListener("change", () => choisirAnim($("optAnim").checked));
+
+  // Après la validation : l'animation, puis un bouton « Envoyer » (le menu de partage du téléphone exige un toucher).
+  let envolSuite = null;
+  // Après la validation : toujours l'aperçu final, avec la case « J'ai vérifié, et je donne mon autorisation pour envoyer ».
+  // Puis l'animation, et un bouton « Envoyer » (le menu de partage du téléphone exige un toucher).
+  function apresValidation(suite) {
+    if (!suite) return;
+    ouvrirApercu(suite);
+  }
+  function envoyerApresApercu(suite) {
+    if (!animationPossible()) { suite(); return; }
+    jouerEnvol().then(() => {
+      envolSuite = suite;
+      const sansPartage = suite === doShare && fmt() !== "text" && !partageFichiers();
+      $("envolEnvoyer").textContent = suite === doCopy ? "Copier" : suite === doSave || sansPartage ? "Enregistrer" : "Envoyer";
+      $("envolCopier").hidden = !sansPartage;
+      $("envolBar").hidden = false; $("envolPasser").hidden = true;
+    });
+  }
+  function fermerEnvol() { $("envol").hidden = true; envolSuite = null; }
+  $("envolRevenir").addEventListener("click", fermerEnvol);
+  $("envolEnvoyer").addEventListener("click", () => { const s2 = envolSuite; fermerEnvol(); if (s2) s2(); });
+  $("envolCopier").addEventListener("click", () => { fermerEnvol(); doCopy(); });
+
+  function jouerEnvol() {
+    return new Promise((fini) => {
+      const p = page(), ov = $("envol"), cvE = $("envolCv");
+      ov.hidden = false; $("envolBar").hidden = true; $("envolPasser").hidden = false;
+      const dpr = Math.min(2, window.devicePixelRatio || 1), W = ov.clientWidth, Ht = ov.clientHeight, H = Ht - 150;
+      cvE.width = Math.round(W * dpr); cvE.height = Math.round(Ht * dpr);
+      const x = cvE.getContext("2d"); x.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const s = Math.min((W - 24) / p.img.width, (H - 24) / p.img.height);
+      const ox = (W - p.img.width * s) / 2, oy = 12 + (H - 24 - p.img.height * s) / 2, pw = p.img.width * s, ph = p.img.height * s;
+      // L'image qui partira (la version publique), et l'original : au départ, on voit encore les données privées.
+      const fin = avecBande(finalCanvas(p, true), true, p);
+      const zones = [];
+      const copie = (r) => ({ x: r.x, y: r.y, w: r.w, h: r.h });
+      p.boxes.filter((b) => b.active).forEach((b) => (b.rects || [b]).forEach((r) => zones.push(copie(r))));
+      p.strokes.forEach((st) => { zones.push(copie(cadreDe(st))); if (st.etiq) st.etiq.rects.forEach((r) => zones.push(copie(r))); });
+      // Chaque zone se transforme à son tour, le coup de vent passant de gauche à droite.
+      let xmin = Infinity, xmax = -Infinity;
+      zones.forEach((r) => { if (r.x < xmin) xmin = r.x; if (r.x > xmax) xmax = r.x; });
+      if (!zones.length) { xmin = 0; xmax = 1; }
+      zones.forEach((r) => { r.dep = 0.7 + ((r.x - xmin) / (xmax - xmin + 1)) * 0.5; });
+      // Les grains de sable : l'encre des lettres privées, qui tombe. Ils ne quittent jamais l'écran de l'appareil.
+      const aire = zones.reduce((a, r) => a + Math.max(0, r.w) * Math.max(0, r.h), 0);
+      const pas = Math.max(2, Math.sqrt(aire / 5000));
+      const gx = [], gy = [], gc = [], gd = [];
+      zones.forEach((r) => {
+        const W = Math.max(1, Math.round(r.w / pas)), H = Math.max(1, Math.round(r.h / pas));
+        const c = document.createElement("canvas"); c.width = W; c.height = H;
+        const cx = c.getContext("2d", { willReadFrequently: true });
+        try { cx.drawImage(p.img, r.x, r.y, r.w, r.h, 0, 0, W, H); } catch (e) { return; }
+        const d = cx.getImageData(0, 0, W, H).data;
+        for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+          const o = (j * W + i) * 4;
+          if (d[o] * 0.299 + d[o + 1] * 0.587 + d[o + 2] * 0.114 < 150) { gx.push(r.x + i * pas); gy.push(r.y + j * pas); gc.push(`rgb(${d[o]},${d[o + 1]},${d[o + 2]})`); gd.push(r.dep); }
+        }
+      });
+      const n = Math.min(gx.length, 7000);
+      const depart = new Float32Array(n), vx = new Float32Array(n), vy = new Float32Array(n);
+      for (let i = 0; i < n; i++) { depart[i] = gd[i] + Math.random() * 0.18; vx[i] = 30 + Math.random() * 90; vy[i] = -Math.random() * 80; }
+      const taille = Math.max(1.5, pas * s * 1.1), g = 1500, duree = 2.6;
+      let t0 = null, finiTot = false;
+      const finir = () => { if (finiTot) return; finiTot = true; dessiner(duree + 1); fini(); };
+      const passer = () => finir();
+      $("envolPasser").onclick = passer; cvE.onclick = passer;
+      function dessiner(t) {
+        x.clearRect(0, 0, W, Ht);
+        // 1. l'original apparaît, avec ses données privées
+        const aP = Math.min(1, Math.max(0, (t - 0.15) / 0.4));
+        x.globalAlpha = aP; x.fillStyle = "#fff"; x.fillRect(ox, oy, pw, ph); x.drawImage(p.img, ox, oy, pw, ph);
+        // 2. zone par zone, la version publique prend la place : le masque et son étiquette (NOM_1…)
+        x.globalAlpha = 1;
+        zones.forEach((r) => {
+          const a = Math.min(1, Math.max(0, (t - r.dep) / 0.35));
+          if (a <= 0) return;
+          x.globalAlpha = a * aP;
+          x.drawImage(fin, r.x, r.y, r.w, r.h, ox + r.x * s, oy + r.y * s, r.w * s, r.h * s);
+        });
+        // 3. les lettres tombent en sable
+        x.globalAlpha = 1;
+        for (let i = 0; i < n; i++) {
+          const dt = t - depart[i];
+          if (dt <= 0 || t < 0.15) continue;
+          const X = ox + gx[i] * s + vx[i] * dt, Y = oy + gy[i] * s + vy[i] * dt + 0.5 * g * dt * dt;
+          if (Y > Ht + 10) continue;
+          x.fillStyle = gc[i];
+          const tl = taille * Math.max(0.4, 1 - dt * 0.6);
+          x.fillRect(X, Y, tl, tl);
+        }
+        // 4. la version publique se pose, avec sa mention
+        const aF = Math.min(1, Math.max(0, (t - 1.95) / 0.5));
+        if (aF > 0) { x.globalAlpha = aF; x.drawImage(fin, ox, oy, pw, (fin.height / fin.width) * pw); x.globalAlpha = 1; }
+        // 0. le flash
+        const aFl = Math.max(0, 1 - t / 0.3);
+        if (aFl > 0) { x.globalAlpha = aFl; x.fillStyle = "#fff"; x.fillRect(0, 0, W, Ht); x.globalAlpha = 1; }
+      }
+      const pas2 = (ts) => {
+        if (finiTot) return;
+        if (t0 === null) t0 = ts;
+        const t = (ts - t0) / 1000;
+        dessiner(t);
+        if (t >= duree) finir(); else requestAnimationFrame(pas2);
+      };
+      requestAnimationFrame(pas2);
+    });
+  }
+
+  // Aperçu final (mode strict) : exactement ce qui va partir, page par page.
+  let apercuSuite = null;
+  function ouvrirApercu(suite) {
+    apercuSuite = suite;
+    const box = $("apercuPages");
+    box.textContent = "";
+    const masked = $("optMask").checked, f = fmt();
+    if (f === "text" || f === "both") {
+      // Envoi en texte : l'aperçu montre le texte exact qui partira, consigne comprise.
+      const pre = document.createElement("pre"); pre.className = "apercu-texte"; pre.textContent = "…"; box.append(pre);
+      prepared().then((out) => { pre.textContent = out.text; })
+        .catch(() => { pre.textContent = "L'aperçu du texte a échoué. Revenez et réessayez."; });
+    }
+    if (f !== "text") S.pages.forEach((p) => {
+      let c = finalCanvas(p, masked);
+      if (f === "light") c = lighten(c);
+      c = avecBande(c, masked, p);
+      const img = document.createElement("img");
+      img.src = c.toDataURL("image/jpeg", 0.8);
+      img.alt = "Aperçu de la page envoyée";
+      box.append(img);
+    });
+    $("apercuOk").checked = false;
+    $("apercuSend").disabled = true;
+    $("apercuSend").textContent = animationPossible() ? "Valider" : suite === doCopy ? "Copier" : suite === doSave ? "Enregistrer" : "Envoyer";
+    $("apercu").hidden = false;
+  }
+  $("apercuOk").addEventListener("change", () => { $("apercuSend").disabled = !$("apercuOk").checked; });
+  $("apercuBack").addEventListener("click", () => { $("apercu").hidden = true; cerbereOk = -1; render(); });
+  $("apercuSend").addEventListener("click", () => {
+    $("apercu").hidden = true;
+    const suite = apercuSuite; apercuSuite = null;
+    if (suite) envoyerApresApercu(suite);
+  });
+  $("btnCerbere").addEventListener("click", () => { cerbereOk = -1; closeSheet(); avecCerbere(() => setStatus("Remove Before Flight : rien d'autre à signaler."), true); });
+
+  /* ------------------------------------------------------------ exemple */
+  function demoPage() {
+    const c = document.createElement("canvas");
+    c.width = 1240; c.height = 1754;
+    const x = c.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+    x.fillStyle = "#111";
+    x.font = "bold 40px Arial, Helvetica, sans-serif";
+    x.fillText("Caisse d'assurance Horizon SA", 90, 140);
+    x.font = "30px Arial, Helvetica, sans-serif";
+    x.fillText("Confirmation de couverture 2027", 90, 200);
+    const L = [
+      "Assuré : Jean Exemple",
+      "Adresse : Rue du Lac 12, 1003 Lausanne",
+      "N° AVS : 756.9217.0769.85",
+      "N° de police : 48291736",
+      "Téléphone : 021 555 12 34",
+      "E-mail : jean.exemple@example.ch",
+      "IBAN : CH93 0076 2011 6238 5295 7",
+      "",
+      "Prime mensuelle : CHF 412.30",
+      "Franchise annuelle : CHF 1'500.00",
+      "Début de la couverture : 1er janvier 2027",
+      "",
+      "Ce document est fictif.",
+    ];
+    L.forEach((t, i) => x.fillText(t, 90, 320 + i * 62));
+    return newPage(c, "exemple.png");
+  }
+  $("goDemo").addEventListener("click", () => {
+    openWork();
+    $("tNames").value = "Jean Exemple";
+    $("tAddr").value = "Rue du Lac 12, 1003 Lausanne";
+    const p = demoPage();
+    S.pages = [p]; S.cur = 0; changed();
+    closeSheet();
+    updateUI();
+    requestAnimationFrame(() => { fitView(); render(); });
+    detectPages([p]);
+  });
+
+  // Accueil : photographier tout de suite, ou importer un document (photo déjà prise, image ou PDF).
+  $("goCam").addEventListener("click", () => { openWork(); ouvrirCamera(); });
+  $("goImport").addEventListener("click", () => { openWork(); $("inFile").click(); });
+
+
+  /* ------------------------- au premier lancement de chaque version : vérifier sa version */
+  const VERSION_APP = "0.8.9";
+  // Les deux seules adresses internet écrites dans le code de Kerckhoffs. Ce sont des liens à ouvrir dans votre navigateur :
+  // l'application ne s'y connecte jamais (voir le verrou connect-src dans index.html).
+  const ADRESSE_OFFICIELLE = "https://kerckhoffs-1883.github.io/kerckhoffs/";
+  const PAGE_VERSIONS = "https://github.com/kerckhoffs-1883/kerckhoffs/blob/main/VERSIONS.md";
+  let versionNouvelle = false;
+  (function verifierVersion() {
+    $("verVersion").textContent = VERSION_APP;
+    $("verOrigine").textContent = location.host || "fichier local";
+    $("verOfficielle").textContent = ADRESSE_OFFICIELLE.replace(/^https:\/\//, "").replace(/\/$/, "") + " (version de test)";
+    $("lienVersions").href = PAGE_VERSIONS;
+    $("adrVersions").textContent = PAGE_VERSIONS.replace(/^https:\/\//, "").replace(/\/blob\/.*/, "");
+    const qr = dessinerQR(PAGE_VERSIONS, "Liste officielle des versions");
+    if (qr) $("qrVersions").appendChild(qr);
+    let vue = null;
+    try { vue = localStorage.getItem("kerckhoffs-version-vue"); } catch (e) {}
+    // L'écran complet s'affiche au premier lancement de cette version, juste après l'ouverture (voir « ouverture » plus bas).
+    versionNouvelle = vue !== VERSION_APP;
+    $("verifOk").addEventListener("click", () => {
+      $("verif").hidden = true;
+      try { localStorage.setItem("kerckhoffs-version-vue", VERSION_APP); } catch (e) {}
+    });
+    $("openVerif").addEventListener("click", () => { $("verif").hidden = false; });
+    // Un message de l'auteur : vérifié ici, avec la clé publique inscrite dans verification.js, sans internet.
+    $("msgVerifier").addEventListener("click", () => {
+      const r = window.KerckhoffsVerification.verifierMessage($("msgSigne").value);
+      const el = $("msgResultat");
+      el.textContent = r.ok ? `Signé par l'auteur ✓ Ce message est authentique et n'a pas été modifié.` : `NON signé par l'auteur : ${r.raison}`;
+      el.className = "empreinte " + (r.ok ? "ok" : "ko");
+    });
+  })();
+
+  /* ------------------------------------------------------ hors ligne et mises à jour */
+  // Le contrôle des signatures est dans verification.js. Ici, on ne fait que l'appeler et afficher le résultat.
+  const V = window.KerckhoffsVerification;
+  const CACHE_ACTUEL = "kerckhoffs-v" + VERSION_APP;
+  // L'écran de vérification dit d'abord l'essentiel en une ligne ; les détails sont sous « En savoir plus ».
+  function statut(texte, etat) { const el = $("verStatut"); el.textContent = texte; el.className = "verif-statut" + (etat ? " " + etat : ""); }
+  const surAdresseOfficielle = () => {
+    const o = new URL(ADRESSE_OFFICIELLE);
+    return location.host === o.host && location.pathname.startsWith(o.pathname);
+  };
+  function afficherEmpreinte(r) {
+    if (!r || r.absente) statut("Vérification possible dans un instant : rouvrez Kerckhoffs.");
+    else if (!r.ok) statut("Attention : cette version n'est PAS signée par l'auteur. Ne l'utilisez pas.", "ko");
+    else if (!surAdresseOfficielle()) statut("Signée par l'auteur ✓, mais ouverte depuis une autre adresse que l'adresse officielle. Voir « En savoir plus ».", "ko");
+    else statut("Version officielle ✓ Signée par l'auteur.", "ok");
+    const el = $("verEmpreinte");
+    if (!r || r.absente) { el.textContent = "disponible une fois l'application gardée sur l'appareil : rouvrez-la dans un instant"; el.className = "empreinte"; return; }
+    el.textContent = r.ok ? `${r.empreinte} · signée par l'auteur ✓` : `${r.empreinte ? r.empreinte + " · " : ""}NON signée : ${r.raison}`;
+    el.className = "empreinte " + (r.ok ? "ok" : "ko");
+  }
+  const st = $("offlineState");
+  if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
+    let enAttente = null, activationDemandee = false, migration = false;
+    const examiner = async (reg) => {
+      const w = reg.waiting;
+      if (!w || w === enAttente || !navigator.serviceWorker.controller) return;
+      enAttente = w;
+      if (migration) return; // ancienne version d'essai en attente : on attend la version actuelle, demandée ci-dessous
+      // La nouvelle version est déjà sur l'appareil, mise de côté. La version actuelle la vérifie avant tout.
+      // Les vieilles copies (versions égales ou plus anciennes que la vôtre) sont effacées : seule une version plus récente peut être examinée.
+      const num = (k) => k.replace("kerckhoffs-v", "").split(".").map(Number);
+      const plusRecente = (x, y) => { for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
+      const noms = [];
+      for (const k of (await caches.keys()).filter((k) => k.startsWith("kerckhoffs-v") && k !== CACHE_ACTUEL)) {
+        if (plusRecente(num(k), num(CACHE_ACTUEL))) noms.push(k); else await caches.delete(k);
+      }
+      let r = { ok: false, raison: "Ses fichiers sont introuvables." };
+      for (const n of noms) { r = await V.verifierCopie(n); if (r.ok) break; }
+      montrerBandeau(r, w);
+    };
+    navigator.serviceWorker.register("sw.js").then(async (reg) => {
+      // Passage unique depuis les versions d'essai d'avant les signatures : elles se mettaient à jour toutes seules,
+      // si bien que cette page est déjà plus récente que la copie gardée sur l'appareil. On demande alors la version actuelle,
+      // qui sera vérifiée et proposée comme d'habitude.
+      if (navigator.serviceWorker.controller && !(await caches.has(CACHE_ACTUEL))) {
+        migration = true;
+        const c = await caches.open("kerckhoffs-demande");
+        await c.put(new URL("demande", document.baseURI).href, new Response(String(Date.now())));
+        reg.update().catch(() => {});
+      }
+      examiner(reg);
+      reg.addEventListener("updatefound", () => {
+        const w = reg.installing;
+        if (w) w.addEventListener("statechange", () => { if (w.state === "installed") { migration = false; examiner(reg); } });
+      });
+      // Regarder s'il y a une nouvelle version à l'ouverture, et à chaque retour dans l'application.
+      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") reg.update().catch(() => {}); });
+      return navigator.serviceWorker.ready;
+    }).then(async () => {
+      st.textContent = "Prêt pour le mode avion"; st.classList.add("ready");
+      afficherEmpreinte(await V.verifierCopie(CACHE_ACTUEL));
+    }).catch(() => { st.textContent = "Mode hors ligne indisponible sur ce navigateur"; afficherEmpreinte(null); });
+    navigator.serviceWorker.addEventListener("controllerchange", () => { if (activationDemandee) location.reload(); });
+    // Une version plus récente existe en ligne : on le dit, sans rien installer.
+    let dejaSignalee = null;
+    navigator.serviceWorker.addEventListener("message", (e) => {
+      if (!e.data || e.data.type !== "version-disponible" || e.data.version === dejaSignalee || enAttente) return;
+      dejaSignalee = e.data.version;
+      bandeau(`Une version ${e.data.version} existe. Rien n'a changé chez vous : vous gardez celle que vous avez vérifiée.`,
+        { action: "Aller la chercher", faire: chercherVersion });
+    });
+    async function chercherVersion() {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (!reg) return;
+      if (!navigator.onLine) { bandeau("Pas de connexion. Aucun souci : votre version continue de fonctionner, exactement comme avant."); return; }
+      bandeau("Recherche d'une nouvelle version…");
+      // Le feu vert, valable dix minutes : sans lui, aucune nouvelle version n'accepte de s'installer (voir sw.js).
+      const c = await caches.open("kerckhoffs-demande");
+      await c.put(new URL("demande", document.baseURI).href, new Response(String(Date.now())));
+      try { await reg.update(); } catch (e) { bandeau("Pas de connexion. Aucun souci : votre version continue de fonctionner, exactement comme avant."); return; }
+      if (!reg.installing && !reg.waiting) bandeau(`Vous avez déjà la dernière version (${VERSION_APP}).`);
+    }
+    $("chercherMaj").addEventListener("click", chercherVersion);
+    var activer = () => { if (!enAttente) return; activationDemandee = true; enAttente.postMessage("activer"); };
+  } else if (FIGE) {
+    st.textContent = "Version figée : sans internet, sans mise à jour"; st.classList.add("ready");
+    $("installBloc").hidden = true; $("lienFige").hidden = true; $("chercherMaj").hidden = true;
+    $("verOrigine").textContent = "ce fichier, sur votre appareil";
+    $("verOfficielle").textContent = "aucune : cette version ne se connecte jamais";
+    const el = $("verEmpreinte");
+    el.textContent = "fichier figé : vérifiez-le avec sa signature, publiée dans VERSIONS.md";
+    el.className = "empreinte";
+    statut("Version figée : vérifiez ce fichier avec sa signature, publiée dans la liste officielle des versions.");
+  } else {
+    st.textContent = "Ouvrez Kerckhoffs depuis son adresse web pour l'utiliser hors ligne";
+    afficherEmpreinte(null);
+  }
+  // Le bandeau du haut : une phrase, et au plus un bouton d'action.
+  let actionBandeau = null;
+  function bandeau(texte, o = {}) {
+    const b = $("majBandeau");
+    b.hidden = false;
+    b.classList.toggle("danger", !!o.danger);
+    $("majTexte").textContent = texte;
+    $("majEmpreinte").hidden = !o.empreinte;
+    $("majEmpreinte").textContent = o.empreinte ? "Numéro de référence : " + o.empreinte : "";
+    actionBandeau = o.faire || null;
+    $("majOk").hidden = !o.action;
+    $("majOk").textContent = o.action || "";
+    $("majPlusTard").textContent = o.action ? "Plus tard" : "Fermer";
+  }
+  $("majOk").addEventListener("click", () => { if (actionBandeau) actionBandeau(); });
+  function montrerBandeau(r) {
+    if (r.ok) {
+      bandeau(`Version ${r.version} téléchargée et signée par l'auteur ✓ Elle ne remplacera la vôtre que si vous le décidez.` +
+        (S.pages.length ? " Terminez d'abord votre travail : l'utiliser efface l'ardoise." : ""),
+        { empreinte: r.empreinte, action: "Utiliser", faire: () => activer() });
+    } else {
+      bandeau("Attention : la version trouvée n'est PAS signée par l'auteur. Elle est refusée : gardez la vôtre et ne rouvrez pas Kerckhoffs " +
+        "avant d'avoir vérifié l'adresse officielle, car le navigateur pourrait tout de même l'installer. (" + r.raison + ")",
+        { danger: true, empreinte: r.empreinte });
+    }
+  }
+  $("majPlusTard").addEventListener("click", () => { $("majBandeau").hidden = true; });
+
+  /* ------------- l'ouverture : le logo, la vérification du code (sans connexion) et votre image de reconnaissance
+   * À chaque ouverture, Kerckhoffs recalcule l'empreinte de ses propres fichiers, gardés sur l'appareil, et la compare
+   * à la liste signée par l'auteur, avec la clé publique inscrite dans verification.js. Aucune connexion n'est nécessaire.
+   * Limite honnête : un code qui se vérifie lui-même attrape un fichier abîmé ou modifié, mais une fausse application
+   * entière pourrait afficher le même écran. Votre image, elle, ne peut pas être copiée : elle est rangée par le navigateur
+   * dans le tiroir de cette adresse, qu'aucune autre adresse ne peut ouvrir. */
+  const SIGNES = ["🌸", "🏔️", "⛵", "🐱", "🌙", "🍎", "🦉", "🌵", "🎈", "🐟", "🍀", "⭐"];
+  const lireSigne = () => { try { const o = JSON.parse(localStorage.getItem("kerckhoffs-signe") || "null"); return o && SIGNES.includes(o.image) ? o : null; } catch (e) { return null; } };
+  function montrerSigne(o) {
+    const el = $("ouvSigne"); el.textContent = "";
+    el.append(document.createTextNode(o.image));
+    if (o.mot) { const m = document.createElement("span"); m.className = "mot"; m.textContent = o.mot; el.append(m); }
+    el.hidden = false;
+  }
+  function choisirSigne() {
+    return new Promise((fini) => {
+      const g = $("signeGrille"); g.textContent = "";
+      let choisi = null;
+      SIGNES.forEach((s) => {
+        const b = document.createElement("button"); b.type = "button"; b.textContent = s;
+        b.setAttribute("role", "radio"); b.setAttribute("aria-checked", "false");
+        b.addEventListener("click", () => {
+          choisi = s;
+          g.querySelectorAll("button").forEach((x) => x.setAttribute("aria-checked", String(x === b)));
+          $("signeOk").disabled = false;
+        });
+        g.append(b);
+      });
+      $("signeChoix").hidden = false;
+      $("signeOk").onclick = () => {
+        if (!choisi) return;
+        const o = { image: choisi, mot: $("signeMot").value.trim().slice(0, 20) };
+        try { localStorage.setItem("kerckhoffs-signe", JSON.stringify(o)); } catch (e) {}
+        $("signeChoix").hidden = true;
+        fini(o);
+      };
+    });
+  }
+  // Le résultat de la vérification, en une ligne. « bloque » : le logo ne s'ouvre pas.
+  async function verifierAuDemarrage() {
+    if (FIGE) return { etat: "attention", texte: "Version figée : vérifiez ce fichier avec sa signature, dans la liste officielle des versions." };
+    if (!window.caches || !("serviceWorker" in navigator)) return { etat: "attention", texte: "Vérification impossible dans ce navigateur." };
+    let r = null;
+    try { r = await V.verifierCopie(CACHE_ACTUEL); } catch (e) { r = null; }
+    const officielle = false; // version de test : jamais bloquée, toujours annoncée comme non signée
+    if (!r || r.absente) return { etat: "attention", texte: "Première ouverture : la vérification du code se fera à la prochaine ouverture." };
+    if (r.ok && officielle) return { etat: "ok", texte: "Code vérifié ✓ · signé par l'auteur" };
+    if (r.ok) return { etat: "attention", texte: "Code signé par l'auteur ✓, mais ouvert depuis une autre adresse que l'adresse officielle." };
+    if (officielle) return { etat: "ko", bloque: true, texte: "Attention : cette version n'est pas signée par l'auteur. Ne l'utilisez pas." };
+    return { etat: "attention", texte: "Version d'essai, non signée par l'auteur : n'y mettez pas de vrais documents." };
+  }
+  let partageEnAttente = false;
+  async function ouverture() {
+    $("ouvStatut").textContent = "Vérification du code…"; $("ouvStatut").className = "ouverture-statut";
+    const r = await verifierAuDemarrage();
+    $("ouvStatut").textContent = r.texte;
+    $("ouvStatut").className = "ouverture-statut " + r.etat;
+    $("ouvAutre").hidden = false;
+    if (r.bloque) {
+      $("ouvLogo").disabled = true;
+      $("ouvAutre").textContent = "En savoir plus";
+      return;
+    }
+    let signe = lireSigne();
+    if (!signe) signe = await choisirSigne();
+    montrerSigne(signe);
+    $("ouvLogo").disabled = false; $("ouvAide").hidden = false;
+    // Un document reçu par « Partager » : on entre tout de suite, la vérification est faite.
+    if (partageEnAttente) entrer();
+  }
+  function entrer() {
+    if ($("ouvLogo").disabled) return;
+    $("ouverture").hidden = true;
+    $("home").hidden = false;
+    if (versionNouvelle && !partageEnAttente) $("verif").hidden = false;
+    lancement();
+  }
+  $("ouvLogo").addEventListener("click", entrer);
+  $("ouvAutre").addEventListener("click", () => {
+    // Le QR code mène à la liste officielle des versions : on y compare le numéro de référence affiché ici, sur un autre appareil.
+    $("verif").hidden = false;
+    const plus = document.querySelector("#verif .verif-plus"); if (plus) plus.open = true;
+    const qr = $("qrVersions"); if (qr && qr.scrollIntoView) qr.scrollIntoView({ block: "center" });
+  });
+
+  /* ------------- ouvrir un document autrement : coller, glisser, capturer l'écran, recevoir depuis « Partager » */
+  const ordinateur = !estTelephone();
+  ["choixPC", "mColler", "mCapture", "emptyColler"].forEach((id) => { $(id).hidden = !ordinateur; });
+  $("importSous").textContent = ordinateur ? "image ou PDF · ou glissez-le ici · Ctrl+V" : "photo déjà prise, image ou PDF";
+  if (!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia)) { $("goCapture").hidden = true; $("mCapture").hidden = true; }
+  const accepte = (f) => f && (/^image\//.test(f.type) || f.type === "application/pdf" || /\.pdf$/i.test(f.name || "") || f.type === "text/plain");
+  function ouvrirFichiers(files) {
+    if (!$("ouverture").hidden) return false; // pas avant d'être entré : la vérification du code passe d'abord
+    files = files.filter(accepte);
+    if (!files.length) return false;
+    closeSheet();
+    if ($("work").hidden) openWork();
+    addFiles(files);
+    return true;
+  }
+  // Ctrl+V : une capture d'écran collée s'ouvre directement. Rien n'est écrit sur le disque.
+  document.addEventListener("paste", (e) => {
+    const files = [...((e.clipboardData && e.clipboardData.files) || [])];
+    if (files.some(accepte)) { e.preventDefault(); ouvrirFichiers(files); return; }
+    // Un texte collé ailleurs que dans un champ : il devient une page à masquer.
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test((e.target && e.target.tagName) || "") || (e.target && e.target.isContentEditable)) return;
+    const texte = e.clipboardData && e.clipboardData.getData("text/plain");
+    if (texte && texte.trim()) { e.preventDefault(); ouvrirTexte(texte, "texte collé"); }
+  });
+  async function collerPressePapiers() {
+    try {
+      const items = await navigator.clipboard.read();
+      const files = [];
+      for (const it of items) for (const type of it.types) if (/^image\//.test(type)) files.push(new File([await it.getType(type)], "capture.png", { type }));
+      if (ouvrirFichiers(files)) return;
+      try { const t = await navigator.clipboard.readText(); if (ouvrirTexte(t, "texte collé")) return; } catch (e) {}
+      setStatus("Aucune image dans le presse-papiers. Faites d'abord une capture (Windows : Win+Maj+S ; Mac : Cmd+Maj+4).", true);
+      if ($("work").hidden) alerteAccueil("Aucune image dans le presse-papiers. Faites d'abord une capture (Windows : Win+Maj+S ; Mac : Cmd+Maj+4), puis Ctrl+V.");
+    } catch (e) {
+      if ($("work").hidden) alerteAccueil("Appuyez simplement sur Ctrl+V (Cmd+V sur Mac) pour coller votre capture.");
+      else setStatus("Appuyez simplement sur Ctrl+V (Cmd+V sur Mac) pour coller votre capture.", true);
+    }
+  }
+  function alerteAccueil(texte) { bandeau(texte); }
+  $("goColler").addEventListener("click", collerPressePapiers);
+  $("mColler").addEventListener("click", () => { closeSheet(); collerPressePapiers(); });
+  $("emptyColler").addEventListener("click", collerPressePapiers);
+  // Glisser un fichier sur la page
+  let glisse = 0;
+  const avecFichiers = (e) => e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+  document.addEventListener("dragenter", (e) => { if (!avecFichiers(e)) return; e.preventDefault(); glisse++; if (!$("work").hidden) $("depot").hidden = false; });
+  document.addEventListener("dragover", (e) => { if (avecFichiers(e)) e.preventDefault(); });
+  document.addEventListener("dragleave", () => { glisse = Math.max(0, glisse - 1); if (!glisse) $("depot").hidden = true; });
+  document.addEventListener("drop", (e) => {
+    if (!avecFichiers(e)) return;
+    e.preventDefault(); glisse = 0; $("depot").hidden = true;
+    ouvrirFichiers([...e.dataTransfer.files]);
+  });
+  // Capturer l'écran : une fenêtre ou un onglet, choisi par vous. Une seule image est prise, puis la capture s'arrête.
+  async function capturerEcran() {
+    closeSheet();
+    let flux2;
+    try { flux2 = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false }); } catch (e) { return; }
+    try {
+      const v = document.createElement("video"); v.muted = true; v.playsInline = true; v.srcObject = flux2;
+      try { await v.play(); } catch (e) {}
+      for (let i = 0; i < 20 && !v.videoWidth; i++) await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 250));
+      const c = toCanvas(v, v.videoWidth, v.videoHeight);
+      if ($("work").hidden) openWork();
+      addPages([newPage(c, "capture")]);
+    } finally { flux2.getTracks().forEach((tr) => tr.stop()); }
+  }
+  $("goCapture").addEventListener("click", capturerEcran);
+  $("mCapture").addEventListener("click", capturerEcran);
+  // « Partager » vers Kerckhoffs (Android, application installée) : le fichier est remis par le service worker,
+  // gardé un instant sur l'appareil, ouvert ici, puis effacé aussitôt.
+  async function recevoirPartage() {
+    if (!/[?&]partage=1/.test(location.search)) return false;
+    try { history.replaceState(null, "", location.pathname); } catch (e) {}
+    const files = [];
+    try {
+      const c = await caches.open("kerckhoffs-partage");
+      for (const req of await c.keys()) {
+        const r = await c.match(req), b = await r.blob();
+        files.push(new File([b], decodeURIComponent(r.headers.get("x-nom") || "document"), { type: b.type }));
+      }
+      await caches.delete("kerckhoffs-partage");
+    } catch (e) {}
+    return ouvrirFichiers(files);
+  }
+
+  /* ---------------------------------------- clavier et souris, sur un ordinateur */
+  document.addEventListener("keydown", (e) => {
+    if ($("work").hidden || !$("profil").hidden || !$("apercu").hidden || !$("envol").hidden) return;
+    const champ = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z" && !champ) { e.preventDefault(); $("undo").click(); return; }
+    if (champ) return;
+    if (e.key === " ") { espace = true; e.preventDefault(); return; }
+    if (e.key === "Escape") {
+      if (S.rbfUn) retourListe();
+      else if (relier) finirRelier();
+      else if (!$("sheet").hidden) closeSheet();
+      else if (!$("cerbere").hidden) fermerCerbere();
+      else if (!$("cherchePanel").hidden) $("chercheAnnuler").click();
+      else if (!$("etiqbar").hidden) fermerEtiq();
+      else if (!$("refbar").hidden) $("refCancel").click();
+      else if (S.sel) $("selCancel").click();
+      else if (S.cadre) $("cropCancel").click();
+      else if (S.trouves) fermerTrouves();
+      else if (tool !== outilBase) setTool(outilBase);
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey || !page()) return;
+    const k = e.key.toLowerCase();
+    const zoomer = (f) => { const r = vp.getBoundingClientRect(), m = [r.width / 2, r.height / 2], img = toImg(r.left + m[0], r.top + m[1]);
+      const s = Math.min(S.view.fit * 12, Math.max(S.view.fit * 0.8, S.view.s * f)); S.view.s = s; S.view.tx = m[0] - img[0] * s; S.view.ty = m[1] - img[1] * s; applyView(); showFit(); };
+    if (k === "d") setTool("brush");
+    else if (k === "m") setTool("move");
+    else if (k === "r") setTool("rect");
+    else if (k === "g") setTool("erase");
+    else if (k === "+" || k === "=") zoomer(1.25);
+    else if (k === "-") zoomer(1 / 1.25);
+    else if (k === "0") { fitView(); render(); }
+    else return;
+    e.preventDefault();
+  });
+  document.addEventListener("keyup", (e) => { if (e.key === " ") espace = false; });
+  window.addEventListener("blur", () => { espace = false; });
+
+  /* ---------------------------------------- installer Kerckhoffs comme une application */
+  let invitation = null;
+  const installee = () => matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  if (installee()) $("installBloc").hidden = true;
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault(); invitation = e;
+    $("btnInstaller").hidden = false;
+  });
+  $("btnInstaller").addEventListener("click", async () => {
+    if (!invitation) return;
+    invitation.prompt();
+    try { await invitation.userChoice; } catch (e) {}
+    invitation = null; $("btnInstaller").hidden = true;
+  });
+  window.addEventListener("appinstalled", () => { $("installBloc").hidden = true; });
+
+  /* ---------------------------------------- au lancement : un document partagé, ou l'appareil photo tout de suite */
+  // Après l'ouverture (le logo touché) : un document partagé s'ouvre, sinon l'appareil photo tout de suite si c'est réglé ainsi.
+  async function lancement() {
+    if (partageEnAttente) { partageEnAttente = false; if (await recevoirPartage()) { $("verif").hidden = true; return; } }
+    const direct = () => estTelephone() && $("optCamDirecte").checked && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && $("work").hidden;
+    if ($("verif").hidden) { if (direct()) $("goCam").click(); }
+    else $("verifOk").addEventListener("click", () => { if (direct()) $("goCam").click(); }, { once: true });
+  }
+  partageEnAttente = /[?&]partage=1/.test(location.search);
+  ouverture();
+})();
