@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Verrou : la page ne peut charger ou contacter que ses propres fichiers. Aucun serveur externe. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; worker-src 'self' blob:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#14202b">
+<title>Kerckhoffs</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ============ OUVERTURE : le logo, la vérification du code (sans connexion) et votre image de reconnaissance ============ -->
+<main id="ouverture" class="ouverture">
+  <button class="ouverture-logo" id="ouvLogo" type="button" disabled aria-label="Enter Kerckhoffs">
+    <img src="icons/icon.svg" alt="" width="132" height="132">
+  </button>
+  <p class="ouverture-statut" id="ouvStatut" role="status">Checking the code…</p>
+  <p class="ouverture-signe" id="ouvSigne" hidden></p>
+  <p class="ouverture-aide" id="ouvAide" hidden>Tap the logo to enter.</p>
+  <button class="link ouverture-lien" id="ouvAutre" type="button" hidden>Check with another device</button>
+
+  <!-- Premier lancement : choisir son image de reconnaissance -->
+  <section class="signe-choix" id="signeChoix" hidden aria-label="Choose your picture">
+    <h2>Choose your picture</h2>
+    <p>It will appear every time you open Kerckhoffs, under the logo. It is your sign that you really are in <em>your</em> Kerckhoffs.</p>
+    <p>A fake app could copy the screen, but never your picture: it stays on this device, and only you know it.</p>
+    <p><strong>If one day you do not see your picture, it is not your Kerckhoffs. Do not use it.</strong></p>
+    <div class="signe-grille" id="signeGrille" role="radiogroup" aria-label="Pictures"></div>
+    <label for="signeMot">A word to add, if you like</label>
+    <input type="text" id="signeMot" maxlength="20" autocomplete="off" spellcheck="false" placeholder="e.g. Peony">
+    <button class="btn primary" id="signeOk" type="button" disabled>This is my picture</button>
+    <p class="hint">Forgot your picture? Clear Kerckhoffs' data in your browser, then reopen it to choose a new one.</p>
+  </section>
+</main>
+
+<!-- ============ ACCUEIL ============ -->
+<main id="home" class="screen accueil" hidden>
+  <header class="brand">
+    <img src="icons/icon.svg" alt="" class="logo" width="44" height="44">
+    <div>
+      <h1>Kerckhoffs</h1>
+      <p class="tag">Mask your personal data before you use an AI.</p>
+    </div>
+  </header>
+
+  <div class="choices">
+    <button class="btn primary big" id="goCam" type="button">Take a photo</button>
+    <button class="btn big" id="goImport" type="button">Import a document<span class="sous-btn" id="importSous">image or PDF · or drop it here</span></button>
+  </div>
+
+  <details class="home-plus" id="homePlus">
+  <summary>More</summary>
+  <div class="choices-pc" id="choixPC" hidden>
+    <button class="btn" id="goColler" type="button">Paste a screenshot<span class="sous-btn">Ctrl+V</span></button>
+    <button class="btn" id="goCapture" type="button">Capture the screen<span class="sous-btn">a window or a tab</span></button>
+  </div>
+  <p class="hint">Kerckhoffs finds names and numbers on its own. You check, complete with your finger, then send.</p>
+
+  <p class="home-links">
+    <button class="link" id="goDemo" type="button">Try with a sample document</button>
+  </p>
+
+  <section class="install" id="installBloc">
+    <h2>Install Kerckhoffs</h2>
+    <p>On a phone: browser menu ⋮ → “Add to Home screen”. On a computer (Chrome or Edge): the install icon in the address bar. Then always open Kerckhoffs from its icon.</p>
+    <button class="btn primary" id="btnInstaller" type="button" hidden>Install Kerckhoffs</button>
+  </section>
+
+  <details class="securite" id="secBloc">
+    <summary>Security and versions</summary>
+    <section class="offline">
+      <p class="offline-state" id="offlineState">Preparing offline mode…</p>
+      <p>Kerckhoffs never connects to the internet. <strong>Try it: turn on airplane mode</strong>, then use the app as usual.</p>
+    </section>
+    <p>Your version never changes on its own. A new version is only installed if you go and get it, and only if it is signed by the author.</p>
+    <p class="hint">Kerckhoffs is in no app store: its only address is the address of this page. Open it in your browser, not from another app.</p>
+    <p class="home-links"><button class="link" id="openVerif" type="button">Check my version</button></p>
+    <p class="home-links"><button class="link" id="chercherMaj" type="button">Look for a new version</button></p>
+    <p class="home-links"><a class="link" id="lienFige" href="download/kerckhoffs-0.9.4.html" download>Frozen version, for sensitive use</a></p>
+  </details>
+  <p class="fineprint">Version 0.9.4 · Free software, AGPL 3.0 license. Provided as is: always check the result before sending it.</p>
+  </details>
+</main>
+
+<!-- ============ ESPACE DE TRAVAIL : la feuille en plein écran, quatre boutons aux quatre coins ============ -->
+<main id="work" class="editor" hidden>
+  <div class="viewport" id="viewport">
+    <canvas id="cv" width="10" height="10"></canvas>
+    <canvas id="fx" class="fx" width="10" height="10" aria-hidden="true"></canvas>
+    <div class="tampon" id="tampon" hidden aria-hidden="true"></div>
+
+    <p class="toast" id="toast" role="status" hidden></p>
+    <div class="pile-haut">
+      <p class="tampon-note" id="tamponNote" hidden>This watermark disappears when you confirm the document, at the moment you send it.</p>
+      <div class="mode-chip" id="modeChip" hidden><span id="modeTexte"></span><button class="btn small" id="modeFin" type="button">Done</button></div>
+      <div class="pages" id="pages" hidden></div>
+      <div class="cadrebar" id="cadrebar" hidden role="alert">
+        <p id="cadreTexte">The frame does not work well for this document. Retake the photo trying to match the frame, or turn the frame off.</p>
+        <div class="cerbere-act">
+          <button class="btn small primary" id="cadreReprendre" type="button">Retake the photo</button>
+          <button class="btn small" id="cadreDesactiver" type="button">Turn off the frame</button>
+        </div>
+      </div>
+      <div class="trouves" id="trouves" hidden role="status">
+        <button class="btn small" id="trouvesPrec" type="button" aria-label="Previous item">‹</button>
+        <span id="trouvesTexte"></span>
+        <button class="btn small" id="trouvesSuiv" type="button" aria-label="Next item">›</button>
+        <button class="btn small" id="trouvesFermer" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="pile-boutons">
+        <button class="style-chip" id="styleChip" type="button" hidden></button>
+        <button class="fit" id="fit" type="button" hidden>Fit</button>
+        <button class="btn small ajout-doc" id="ajoutDoc" type="button" hidden>＋ Document</button>
+        <button class="btn small chercher-ici" id="chercherIci" type="button" hidden><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></svg> Search here</button>
+      </div>
+    </div>
+
+    <button class="zones-chip" id="zonesChip" type="button" hidden></button>
+    <button class="btn primary crop-screen" id="cropScreen" type="button" hidden>Keep what is on screen</button>
+    <div class="selbar" id="cropbar" hidden>
+      <button class="btn small primary" id="cropOk" type="button">Crop here</button>
+      <button class="btn small" id="cropCancel" type="button" aria-label="Cancel cropping">✕</button>
+    </div>
+    <div class="selbar" id="selbar" hidden>
+      <span class="refbar-titre">It is:</span>
+      <button class="btn small" type="button" data-ref="PERSONNE">a name</button>
+      <button class="btn small" type="button" data-ref="ADRESSE">an address</button>
+      <button class="btn small" type="button" data-ref="NUMERO">a number or code</button>
+      <button class="btn small" type="button" id="selAutre">other…</button>
+      <button class="btn small primary" id="selAll" type="button">All matches</button>
+      <button class="btn small dark" id="selMask" type="button">Mask</button>
+      <button class="btn small" id="selPlus" type="button">More…</button>
+      <span class="sel-plus" id="selPlusBloc" hidden>
+        <button class="btn small" id="selColonne" type="button" hidden>The whole column, except the header</button>
+        <button class="btn small" id="selZone" type="button">Same place, every page</button>
+      </span>
+      <button class="btn small" id="selRef" type="button" hidden>Tag</button>
+      <button class="btn small" id="selCancel" type="button" aria-label="Cancel the selection">✕</button>
+      <span class="etiq-saisie" id="selSaisie" hidden>
+        <input type="text" id="selChamp" maxlength="24" spellcheck="false" autocapitalize="characters" placeholder="e.g. CAR" aria-label="Label name">
+        <button class="btn small primary" type="button" id="selOk">OK</button>
+      </span>
+    </div>
+    <div class="selbar" id="refbar" hidden>
+      <span class="refbar-titre">It is:</span>
+      <button class="btn small" type="button" data-ref="PERSONNE">a name</button>
+      <button class="btn small" type="button" data-ref="ADRESSE">an address</button>
+      <button class="btn small" type="button" data-ref="REF">a reference</button>
+      <button class="btn small" type="button" data-ref="DONNEE">something else</button>
+      <button class="btn small" id="refCancel" type="button" aria-label="Cancel">✕</button>
+    </div>
+    <div class="selbar" id="etiqbar" hidden>
+      <span class="refbar-titre" id="etiqTitre">It is:</span>
+      <button class="btn small" type="button" data-etiq="PERSONNE">a name</button>
+      <button class="btn small" type="button" data-etiq="ADRESSE">an address</button>
+      <button class="btn small" type="button" data-etiq="NUMERO">a number or code</button>
+      <button class="btn small" type="button" id="etiqAutre">other…</button>
+      <button class="btn small" type="button" id="etiqRenommer">Rename</button>
+      <button class="btn small" type="button" id="etiqRelier">Link…</button>
+      <button class="btn small" type="button" id="etiqDetacher" hidden>Detach</button>
+      <button class="btn small" type="button" id="etiqVisible">Make visible</button>
+      <button class="btn small" id="etiqCancel" type="button" aria-label="Close">✕</button>
+      <span class="etiq-saisie" id="etiqSaisie" hidden>
+        <input type="text" id="etiqChamp" maxlength="24" spellcheck="false" autocapitalize="characters" aria-label="Label name">
+        <button class="btn small primary" type="button" id="etiqOk">OK</button>
+      </span>
+      <p class="hint etiq-aide" id="etiqAide" hidden></p>
+    </div>
+    <div class="cherche-panel" id="cherchePanel" hidden>
+      <p><strong>Search everywhere:</strong> untick what is not private data.</p>
+      <div class="cherche-liste" id="chercheListe"></div>
+      <div class="cerbere-foot">
+        <button class="btn small" id="chercheAnnuler" type="button">Mask only this area</button>
+        <button class="btn small primary" id="chercheOk" type="button">Search</button>
+      </div>
+    </div>
+    <div class="empty" id="empty">
+      <div class="empty-inner">
+        <button class="btn primary" id="emptyCam" type="button">Take a photo</button>
+        <button class="btn ghost" id="emptyFile" type="button">Import an image or a PDF</button>
+        <button class="btn ghost" id="emptyColler" type="button" hidden>Paste a screenshot (Ctrl+V)</button>
+      </div>
+    </div>
+    <div class="rbf-un" id="rbfUn" hidden>
+      <div class="rbf-un-texte"><strong id="rbfUnLabel"></strong><span id="rbfUnTexte"></span></div>
+      <div class="cerbere-act">
+        <button class="btn small dark" id="rbfUnMasquer" type="button">Mask</button>
+        <button class="btn small" id="rbfUnLaisser" type="button">Leave</button>
+        <button class="btn small" id="rbfUnTrois" type="button" hidden></button>
+      </div>
+    </div>
+    <div class="depot" id="depot" hidden><p>Drop the document here</p></div>
+
+    <!-- Les quatre coins -->
+    <button class="coin coin-hg" id="undo" type="button" aria-label="Undo the last action" title="Undo the last action (Ctrl+Z)"><svg class="icone-annuler" viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5M4 9h11a5 5 0 010 10h-4"/></svg><svg class="icone-liste" viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/><path d="M19 6v2M19 11v2M19 16v2"/></svg></button>
+    <button class="coin coin-hd" id="coinMove" type="button" aria-pressed="false" aria-label="Move the page" title="Move the page (M, or space bar)"><svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18M9 6l3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3M18 9l3 3-3 3"/></svg></button>
+    <button class="coin coin-bg" id="btnOpts" type="button" aria-label="Menu: send and other tools" title="Menu"><svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+    <button class="coin coin-bd" id="coinDoigt" type="button" aria-pressed="true" aria-label="Erase with your finger" title="Erase with your finger (D)"><svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11V4.5a1.5 1.5 0 013 0V10"/><path d="M12 9.5V8a1.5 1.5 0 013 0v2.5"/><path d="M15 10a1.5 1.5 0 013 0v4.5c0 3.6-2.5 6.5-6 6.5h-.6c-2 0-3.4-.8-4.6-2.3L4.3 15a1.5 1.5 0 012.3-1.9L9 15"/></svg></button>
+  </div>
+
+  <input type="file" id="inCam" accept="image/*" capture="environment" hidden>
+  <input type="file" id="inFile" accept="application/pdf,image/*" multiple hidden>
+
+  <!-- Caméra intégrée : la photo ne passe jamais par la galerie -->
+  <div class="camview" id="camView" hidden>
+    <div class="cam-stage">
+      <video id="camVideo" playsinline muted autoplay></video>
+      <canvas class="cam-cadre" id="camCadre" hidden aria-hidden="true"></canvas>
+      <span class="cam-focus" id="camFocus" hidden></span>
+      <p class="cam-tip">Tap the document to focus. Hold the phone 20–30 cm (8–12 in) away, parallel to the page.</p>
+    </div>
+    <div class="cambar">
+      <div class="cam-gauche">
+        <button class="btn small" id="camCancel" type="button">Cancel</button>
+        <button class="btn small" id="camImport" type="button">Import</button>
+      </div>
+      <button class="shutter" id="camShot" type="button" aria-label="Take the photo"></button>
+      <button class="btn small" id="camTorch" type="button" aria-pressed="false" hidden>Torch</button>
+    </div>
+    <p class="cam-note">This photo does not go into the gallery. <button class="link" id="camSysteme" type="button">Use the phone's camera app</button></p>
+  </div>
+
+  <!-- Le menu : envoyer d'abord, puis les outils, puis les réglages -->
+  <div class="backdrop" id="backdrop" hidden></div>
+  <section class="sheet" id="sheet" hidden aria-label="Menu">
+    <div class="sheet-head">
+      <h3>Menu</h3>
+      <span class="pageinfo" id="pageInfo"></span>
+      <button class="btn small" id="closeSheet" type="button">Close</button>
+    </div>
+
+    <div class="menu-envoi">
+      <button class="btn primary big avec-avion" id="btnShare" type="button"><svg class="avion" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="currentColor"><path d="M21 15.5v-1.8l-7.5-4.7V4.2c0-.8-.7-1.5-1.5-1.5s-1.5.7-1.5 1.5V9L3 13.7v1.8l7.5-2.3v4.7L8.6 19.3v1.4l3.4-1 3.4 1v-1.4l-1.9-1.4v-4.7z"/></svg> Send</button>
+      <div class="menu-ligne">
+        <button class="btn" id="btnCopy" type="button">Copy the image</button>
+        <button class="btn" id="btnSave" type="button">Save</button>
+      </div>
+    </div>
+
+    <div class="menu-outils" role="group" aria-label="Tools">
+      <button class="outil" id="mRect" type="button"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><rect x="3" y="7" width="18" height="10" rx="1.5" fill="currentColor"/></svg><span>Rectangle</span><small>select, find everywhere</small></button>
+      <button class="outil" id="mChercher" type="button"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></svg><span>Search here</span><small>read the visible area up close</small></button>
+      <button class="outil" id="mGomme" type="button"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l5 5-11 11H5l-3-3L16 3zM9 10l5 5M10 21h11"/></svg><span>Eraser</span><small>bring an item back</small></button>
+      <button class="outil" id="mRecadrer" type="button"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2v14a2 2 0 002 2h14M2 6h14a2 2 0 012 2v14"/></svg><span>Crop</span><small>keep only the page</small></button>
+      <button class="outil" id="btnCam" type="button"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg><span>Add a photo</span><small>new document</small></button>
+      <button class="outil" id="btnFile" type="button"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6v18h12V7zM14 3v4h4M12 11v6M9 14l3 3 3-3"/></svg><span>Import</span><small>image or PDF</small></button>
+      <label class="check meme-forme" id="memeFormeBloc" hidden><input type="checkbox" id="optMemeForme"> Same layout as the previous one: the frame and erased areas carry over to the added document</label>
+      <button class="outil" id="mColler" type="button" hidden><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4h6v3H9zM7 5H5v16h14V5h-2"/></svg><span>Paste a screenshot</span><small>Ctrl+V</small></button>
+      <button class="outil" id="mCapture" type="button" hidden><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="13" rx="1.5"/><path d="M8 21h8M12 17v4"/></svg><span>Capture the screen</span><small>a window or a tab</small></button>
+    </div>
+
+    <details class="group" id="termsPanel">
+      <summary>What to mask</summary>
+      <label for="tNames">Names</label>
+      <input type="text" id="tNames" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="E.g. John Sample, Mary Sample">
+      <label for="tAddr">Addresses</label>
+      <input type="text" id="tAddr" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="E.g. 12 Lake Street, Springfield">
+      <label for="tOther">Other terms</label>
+      <input type="text" id="tOther" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Employer, file number, name of the practice…">
+      <p class="hint">Separate with commas. Swiss AHV numbers, IBANs, phone numbers, emails and long numbers are found on their own.</p>
+      <label for="pays">Country of the documents</label>
+      <select id="pays"></select>
+      <p class="hint">Kerckhoffs finds the numbers specific to the chosen country.</p>
+      <button class="btn" id="detect" type="button">Detect again</button>
+    </details>
+
+    <details class="group">
+      <summary>My profile</summary>
+      <p class="hint" id="pfStatut">No words saved yet.</p>
+      <button class="btn" id="pfSave" type="button">Save my profile (QR code)</button>
+      <button class="btn" id="pfOpen" type="button">Open a profile (QR code image)</button>
+      <input type="file" id="inProfil" accept="image/*" hidden>
+      <p class="hint" id="zonesInfo"></p>
+      <button class="btn" id="zonesClear" type="button" hidden>Clear the repeated areas</button>
+      <p class="hint">The profile keeps your names and words to mask, never your documents. It is encrypted with your passphrase: without it, the image cannot be read.</p>
+    </details>
+
+    <details class="group">
+      <summary>Settings</summary>
+      <fieldset class="choix-niveau">
+        <legend>Remove Before Flight</legend>
+        <label class="check"><input type="radio" name="niveau" value="strict" id="niveauStrict" checked> Strict: the list at every send, everything is checked</label>
+        <label class="check"><input type="radio" name="niveau" value="normal" id="niveauNormal"> Normal: the list only if something is left</label>
+        <p class="hint" id="niveauNote">In Strict, every point must be handled, Kerckhoffs does a final sweep, then a preview appears before sending.</p>
+        <input type="checkbox" id="optStrict" hidden checked>
+      </fieldset>
+      <label class="check" id="mentionBloc"><input type="checkbox" id="optMention" checked> Notice “Masked by the user, with Kerckhoffs” at the bottom of the document</label>
+      <p class="hint">In Normal, the notice always stays. In Strict, you can remove it. Every erased area carries the red “kerckhoffs.app” mark anyway. The notice is not a guarantee: you are the one who confirms what is sent.</p>
+      <fieldset class="choix-niveau">
+        <legend>What covers the data</legend>
+        <label class="check"><input type="radio" name="style" value="auto" id="styleAuto" checked> Automatic: paper color for a document, opaque blur for a photo</label>
+        <label class="check"><input type="radio" name="style" value="papier" id="stylePapier"> Paper color, everywhere</label>
+        <label class="check"><input type="radio" name="style" value="flou" id="styleFlou"> Opaque blur, everywhere: a patch of the average color</label>
+        <label class="check"><input type="radio" name="style" value="noir" id="styleNoir"> Black, everywhere</label>
+        <p class="hint">In every case, nothing is left underneath: the document sent is a brand new image.</p>
+      </fieldset>
+      <label class="check"><input type="checkbox" id="optGaucher"> I'm left-handed: mirrored buttons</label>
+      <label class="check" id="camDirecteBloc"><input type="checkbox" id="optCamDirecte" checked> Open the camera directly</label>
+      <label class="check"><input type="checkbox" id="optAnim" checked> Animations</label>
+      <p class="hint">Letters fall like sand when you erase, and when the document is sent.</p>
+      <label class="brush" for="brush">Finger size
+        <input type="range" id="brush" min="1" max="14" value="4">
+      </label>
+      <button class="btn avec-avion" id="btnCerbere" type="button"><svg class="avion" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="currentColor"><path d="M21 15.5v-1.8l-7.5-4.7V4.2c0-.8-.7-1.5-1.5-1.5s-1.5.7-1.5 1.5V9L3 13.7v1.8l7.5-2.3v4.7L8.6 19.3v1.4l3.4-1 3.4 1v-1.4l-1.9-1.4v-4.7z"/></svg> Run the “Remove Before Flight” check</button>
+      <div class="formats-bloc">
+        <p class="hint"><strong>Sending format</strong></p>
+        <div class="formats" id="formats" role="radiogroup" aria-label="Format"></div>
+        <p class="hint">Hidden photo metadata (place, date, device) is always removed.</p>
+      </div>
+    </details>
+
+    <button class="btn" id="back" type="button">Close the document and go back to the start</button>
+    <p class="status" id="status" role="status"></p>
+    <div class="legend" id="legend" hidden></div>
+  </section>
+
+  <!-- Cerbère : le rapport avant envoi -->
+  <section class="sheet cerbere" id="cerbere" hidden aria-label="Remove Before Flight: check before sending">
+    <h3 class="ruban ruban-haut"><svg class="avion" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="currentColor"><path d="M21 15.5v-1.8l-7.5-4.7V4.2c0-.8-.7-1.5-1.5-1.5s-1.5.7-1.5 1.5V9L3 13.7v1.8l7.5-2.3v4.7L8.6 19.3v1.4l3.4-1 3.4 1v-1.4l-1.9-1.4v-4.7z"/></svg><span>Remove before sending</span><svg class="avion" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="currentColor"><path d="M21 15.5v-1.8l-7.5-4.7V4.2c0-.8-.7-1.5-1.5-1.5s-1.5.7-1.5 1.5V9L3 13.7v1.8l7.5-2.3v4.7L8.6 19.3v1.4l3.4-1 3.4 1v-1.4l-1.9-1.4v-4.7z"/></svg></h3>
+    <p class="rbf-alerte" id="cerbereAlerte" hidden><strong>Warning:</strong> a postcode, an age, sex, a situation (unemployment, dismissal) or a rare disease is often enough to find a person, even without their name. If several of these remain visible, mask at least one before sending.</p>
+    <p id="cerbereIntro"></p>
+    <ul class="cerbere-list" id="cerbereList"></ul>
+    <p class="hint" id="cerbereAide">Tap a point: the image shows where it is. Tap twice: it stays alone at the bottom, with almost the whole screen for the photo.</p>
+    <p class="hint strict-note" id="cerbereStrictNote" hidden>Strict level: handle every point (Mask or Leave) to continue.</p>
+    <p class="rbf-mention" id="cerbereMention"></p>
+    <button class="btn" id="cerbereBalayage" type="button">Final sweep: search everywhere for what is already masked</button>
+    <div class="cerbere-foot">
+      <button class="btn" id="cerbereBack" type="button">Back</button>
+      <button class="btn primary" id="cerbereSend" type="button">Send</button>
+    </div>
+    <p class="ruban ruban-bas"><svg class="avion" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="currentColor"><path d="M21 15.5v-1.8l-7.5-4.7V4.2c0-.8-.7-1.5-1.5-1.5s-1.5.7-1.5 1.5V9L3 13.7v1.8l7.5-2.3v4.7L8.6 19.3v1.4l3.4-1 3.4 1v-1.4l-1.9-1.4v-4.7z"/></svg><span>Remove before flight</span><svg class="avion" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="currentColor"><path d="M21 15.5v-1.8l-7.5-4.7V4.2c0-.8-.7-1.5-1.5-1.5s-1.5.7-1.5 1.5V9L3 13.7v1.8l7.5-2.3v4.7L8.6 19.3v1.4l3.4-1 3.4 1v-1.4l-1.9-1.4v-4.7z"/></svg></p>
+  </section>
+
+  <!-- Le document part : les zones masquées tombent comme du sable, puis l'image envoyée se pose -->
+  <section class="envol" id="envol" hidden aria-label="The document is ready to go">
+    <canvas id="envolCv" aria-hidden="true"></canvas>
+    <button class="link envol-passer" id="envolPasser" type="button">Skip</button>
+    <div class="envol-bar" id="envolBar" hidden>
+      <p class="envol-texte">What was masked no longer exists. Here is exactly what is sent.</p>
+      <div class="cerbere-foot">
+        <button class="btn" id="envolRevenir" type="button">Back</button>
+        <button class="btn" id="envolCopier" type="button" hidden>Copy the image</button>
+        <button class="btn primary" id="envolEnvoyer" type="button">Send</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Bandeau de mise à jour -->
+<div class="maj" id="majBandeau" hidden role="status">
+  <span id="majTexte">New version available.</span>
+  <span id="majEmpreinte" class="empreinte" hidden></span>
+  <button class="btn small primary" id="majOk" type="button">Use it</button>
+  <button class="btn small" id="majPlusTard" type="button">Later</button>
+</div>
+
+<!-- Profil : créer ou ouvrir le QR code -->
+<section class="overlay" id="profil" hidden aria-label="My profile">
+  <div class="overlay-inner">
+    <div id="pfVueCreer" hidden>
+      <h3>Save my profile</h3>
+      <p>Kerckhoffs will make an encrypted QR code with your names and words to mask. Keep the image: next time, import it to get your settings back.</p>
+      <label for="pfPass">Passphrase</label>
+      <input type="password" id="pfPass" autocomplete="new-password" placeholder="For example four random words">
+      <label for="pfPass2">Repeat the passphrase</label>
+      <input type="password" id="pfPass2" autocomplete="new-password">
+      <p class="hint">At least 12 characters. Without it, nobody can read the profile, not even you: write it down somewhere safe.</p>
+      <div class="cerbere-foot"><button class="btn pfFermer" type="button">Cancel</button><button class="btn primary" id="pfCreer" type="button">Create the QR code</button></div>
+    </div>
+    <div id="pfVueQR" hidden>
+      <h3>Your profile QR code</h3>
+      <img id="pfImage" class="pf-image" alt="Encrypted Kerckhoffs profile QR code">
+      <p id="pfInfo"></p>
+      <div class="cerbere-foot"><button class="btn" id="pfPartager" type="button">Share</button><button class="btn primary" id="pfEnregistrer" type="button">Save the image</button></div>
+      <button class="btn pfFermer" type="button">Close</button>
+    </div>
+    <div id="pfVueOuvrir" hidden>
+      <h3>Kerckhoffs profile found</h3>
+      <p>This image contains an encrypted profile. Enter its passphrase to open it.</p>
+      <label for="pfPassOuvrir">Passphrase</label>
+      <input type="password" id="pfPassOuvrir" autocomplete="current-password">
+      <div class="cerbere-foot"><button class="btn pfFermer" type="button">Cancel</button><button class="btn primary" id="pfDechiffrer" type="button">Open</button></div>
+    </div>
+    <div id="pfVueResume" hidden>
+      <h3>Use this profile?</h3>
+      <p id="pfResume"></p>
+      <p class="hint">Compare the fingerprint with the one written under the QR code, or with your colleague's.</p>
+      <div class="cerbere-foot"><button class="btn pfFermer" type="button">Cancel</button><button class="btn primary" id="pfUtiliser" type="button">Use this profile</button></div>
+    </div>
+    <p class="pf-erreur" id="pfErreur" role="alert"></p>
+  </div>
+</section>
+
+<!-- Après la détection : ce qui a été trouvé et masqué tout seul est d'abord soumis -->
+<section class="overlay" id="masquageAuto" hidden aria-label="Items found">
+  <div class="overlay-inner">
+    <h3 id="maTitre"></h3>
+    <p id="maTexte"></p>
+    <button class="btn primary" id="maTout" type="button">Mask all</button>
+    <button class="btn" id="maChoisir" type="button">Choose one by one</button>
+    <button class="btn" id="maRien" type="button">Mask nothing</button>
+  </div>
+</section>
+
+<!-- Après l'import d'un nouveau document, avant la lecture : son importance règle le contrôle avant l'envoi -->
+<section class="overlay" id="importance" hidden aria-label="Importance of the document">
+  <div class="overlay-inner">
+    <h3>This document is rather…</h3>
+    <input type="range" id="impCurseur" min="0" max="2" step="1" value="1" aria-describedby="impNote" aria-label="Importance of the document">
+    <div class="imp-reperes" aria-hidden="true"><span>Public</span><span>Personal</span><span>Official</span></div>
+    <p id="impNote"></p>
+    <button class="btn primary" id="impOk" type="button">Continue</button>
+  </div>
+</section>
+
+<!-- Fin de session -->
+<section class="overlay" id="finSession" hidden aria-label="End of session">
+  <div class="overlay-inner">
+    <h3>Keep the words from this session?</h3>
+    <p>You added names or words to mask. Kerckhoffs will erase everything when going back to the start. To get them back next time, save them in a profile QR code.</p>
+    <button class="btn primary" id="finGarder" type="button">Save my profile</button>
+    <button class="btn" id="finEffacer" type="button">No, erase everything</button>
+    <button class="btn" id="finRester" type="button">Keep working</button>
+  </div>
+</section>
+
+<!-- Aperçu final : à chaque envoi, dans les deux niveaux -->
+<section class="overlay" id="apercu" hidden aria-label="Final preview">
+  <div class="overlay-inner">
+    <h3>Final preview</h3>
+    <p class="hint">Here is exactly what will be sent. Check every page.</p>
+    <div class="apercu-pages" id="apercuPages"></div>
+    <label class="check"><input type="checkbox" id="apercuOk"> I have checked, and I authorize sending</label>
+    <div class="cerbere-foot">
+      <button class="btn" id="apercuBack" type="button">Back</button>
+      <button class="btn primary" id="apercuSend" type="button" disabled>Send</button>
+    </div>
+  </div>
+</section>
+
+<!-- Vérification de la version, au premier lancement -->
+<section class="overlay" id="verif" hidden aria-label="Check your version">
+  <div class="overlay-inner">
+    <h3>Your version of Kerckhoffs</h3>
+    <p class="verif-statut" id="verStatut">Checking…</p>
+    <p><strong>It will never change on its own.</strong> It stays exactly the same, with or without internet. A new version is only installed if you go and get it, and only if it is signed by the author.</p>
+    <button class="btn primary" id="verifOk" type="button">Continue</button>
+    <details class="verif-plus">
+    <summary>Learn more</summary>
+    <dl class="verif-list">
+      <dt>Version</dt><dd id="verVersion"></dd>
+      <dt>You are using it from</dt><dd id="verOrigine"></dd>
+      <dt>Official address</dt><dd id="verOfficielle"></dd>
+      <dt>Reference number</dt><dd id="verEmpreinte" class="empreinte">computing…</dd>
+    </dl>
+    <p>Both addresses must be identical, and the reference number must be the same as the one published for this version, at the official address. Every official version is signed by the author of Kerckhoffs.</p>
+    <p>If a new version exists, Kerckhoffs tells you, that is all: you go and get it, whenever you want. It is then checked before being offered to you, and refused if it is not signed.</p>
+    <div class="verif-lien" id="verLienBloc">
+      <a class="btn" id="lienVersions" target="_blank" rel="noopener noreferrer">Open the official list of versions</a>
+      <p class="hint">Check that the address bar shows: <span class="empreinte" id="adrVersions"></span></p>
+      <div class="verif-qr" id="qrVersions"></div>
+      <p class="hint">Even safer: scan this code with <strong>another</strong> phone or a computer. Kerckhoffs does not connect: this link only opens your browser.</p>
+    </div>
+    <details class="verif-message" id="msgBloc">
+      <summary>Check a message from the author</summary>
+      <p class="hint">Every official message from the author is signed with the author's seal. Paste the whole message here, from “-----DÉBUT” to “-----FIN-----”: Kerckhoffs checks, without internet, that it really comes from the author and that no word was changed.</p>
+      <textarea id="msgSigne" rows="6" placeholder="-----DÉBUT MESSAGE KERCKHOFFS-----"></textarea>
+      <button class="btn" id="msgVerifier" type="button">Check the message</button>
+      <p class="empreinte" id="msgResultat" role="status"></p>
+    </details>
+    <p class="hint">A fake copy could show this same screen, with a fake link. The safest is still to know the official address another way: a bookmark, or someone you trust. For sensitive use, there is also a signed file that never updates itself.</p>
+    </details>
+  </div>
+</section>
+
+<script src="vendor/jspdf/jspdf.umd.min.js"></script>
+<script src="vendor/tesseract/tesseract.min.js"></script>
+<script src="vendor/qrcode/qrcode.js"></script>
+<script src="vendor/jsqr/jsQR.js"></script>
+<script src="rules/registry.js"></script>
+<script src="rules/common.js"></script>
+<script src="rules/remove-before-flight.js"></script>
+<script src="rules/labels.js"></script>
+<!-- One file per country: see rules/README.md -->
+<script src="rules/countries/ch.js"></script>
+<script src="vendor/tweetnacl/nacl.min.js"></script>
+<script src="verification.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
